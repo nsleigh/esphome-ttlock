@@ -180,6 +180,7 @@ class TTLockLock : public lock::Lock,
   void handle_response_(uint8_t cmd, const std::vector<uint8_t> &payload);
 
   // ── Lock/unlock sequence ───────────────────────────────────────────────
+  void arm_op_watchdog_();
   void start_pending_();
   void do_query_status_();
   void do_check_admin_();

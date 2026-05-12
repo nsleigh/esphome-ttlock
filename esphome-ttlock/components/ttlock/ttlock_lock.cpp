@@ -1,5 +1,6 @@
 #include "ttlock_lock.h"
 #include "esphome/core/log.h"
+#include "esphome/core/application.h"
 
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -247,6 +248,7 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       } else {
         // If there are still pending operations (e.g. unlock retry), reconnect immediately
         // rather than waiting for the next advertisement.
+        arm_op_watchdog_();  // re-arm for each retry so the full 90 s window resets
         this->parent()->set_enabled(true);
         if (this->parent()->state() == espbt::ClientState::IDLE)
           this->parent()->set_state(espbt::ClientState::DISCOVERED);
@@ -574,6 +576,36 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
   }
 }
 
+// ── Operation watchdog ────────────────────────────────────────────────────────
+// Arms a 90-second one-shot timeout.  If pending operations are still set when
+// it fires, either the BLEClient is IDLE (reconnect and re-arm) or it is stuck
+// in CONNECTING/DISCONNECTING (clear ops; publish JAMMED only for user-initiated ops).
+
+void TTLockLock::arm_op_watchdog_() {
+  cancel_timeout("op_wdog");
+  set_timeout("op_wdog", 90000, [this]() {
+    if (pending_op_ == PendingOp::NONE)
+      return;
+    auto st = this->parent()->state();
+    ESP_LOGW(TAG, "Op watchdog fired (client state=%d)", (int) st);
+    if (st == espbt::ClientState::IDLE) {
+      ESP_LOGW(TAG, "Watchdog: client IDLE with pending ops – reconnecting");
+      this->parent()->set_enabled(true);
+      this->parent()->set_state(espbt::ClientState::DISCOVERED);
+      arm_op_watchdog_();
+    } else {
+      bool had_user_op = (pending_op_ != PendingOp::QUERY);
+      ESP_LOGE(TAG, "Watchdog: client stuck – abandoning pending ops");
+      pending_op_ = PendingOp::NONE;
+      op_state_   = OpState::IDLE;
+      rx_buf_.clear();
+      if (had_user_op)
+        this->publish_state(lock::LOCK_STATE_JAMMED);
+      this->parent()->set_enabled(false);
+    }
+  });
+}
+
 // ── Normal operation sequence ─────────────────────────────────────────────────
 
 void TTLockLock::start_pending_() {
@@ -710,6 +742,7 @@ void TTLockLock::request_update() {
   ESP_LOGI(TAG, "Got request to update status");
   if (pending_op_ == PendingOp::NONE)
     pending_op_ = PendingOp::QUERY;
+  arm_op_watchdog_();
   this->parent()->set_enabled(true);
   auto ble_st = this->parent()->state();
   if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
@@ -729,6 +762,7 @@ void TTLockLock::set_passage_mode(bool enable) {
   } else {
     this->publish_state(lock::LOCK_STATE_LOCKING);
   }
+  arm_op_watchdog_();
   this->parent()->set_enabled(true);
   auto ble_st = this->parent()->state();
   if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
@@ -749,6 +783,7 @@ void TTLockLock::control(const lock::LockCall &call) {
   if (*state == lock::LOCK_STATE_UNLOCKED) {
     pending_op_ = PendingOp::UNLOCK;
     this->publish_state(lock::LOCK_STATE_UNLOCKING);
+    arm_op_watchdog_();
     {
       auto ble_st = this->parent()->state();
       if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
@@ -763,6 +798,7 @@ void TTLockLock::control(const lock::LockCall &call) {
     } else {
       pending_op_ = PendingOp::LOCK;
       this->publish_state(lock::LOCK_STATE_LOCKING);
+      arm_op_watchdog_();
       auto ble_st = this->parent()->state();
       if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
         start_pending_();
@@ -836,6 +872,7 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
     // stuck at RUNNING after disconnect, preventing scan restart.
     if (pending_op_ == PendingOp::NONE)
       pending_op_ = PendingOp::QUERY;
+    arm_op_watchdog_();
     this->parent()->set_enabled(true);
     if (this->parent()->state() == espbt::ClientState::IDLE)
       this->parent()->set_state(espbt::ClientState::DISCOVERED);
