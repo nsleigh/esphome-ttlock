@@ -245,7 +245,12 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       // rather than waiting for the next advertisement.
       if (pending_unlock_ || pending_lock_ || pending_passage_on_ || pending_passage_off_) {
         this->parent()->set_enabled(true);
-        this->parent()->connect();
+        if (this->parent()->state() == espbt::ClientState::IDLE)
+          this->parent()->connect();
+      } else {
+        // No pending operations: disable so the scanner can resume.
+        // parse_device() will re-enable when the lock next advertises with changed params.
+        this->parent()->set_enabled(false);
       }
       break;
 
@@ -833,6 +838,8 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
     // Calling connect() directly here would bypass that sequencing and cause
     // both locks to attempt simultaneous connections, hanging the BLE stack.
     this->parent()->set_enabled(true);
+    if (this->parent()->state() == espbt::ClientState::IDLE)
+      this->parent()->connect();
     return true;
   }
   return false;
