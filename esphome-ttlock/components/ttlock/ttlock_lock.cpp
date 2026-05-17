@@ -246,7 +246,7 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       if (pending_unlock_ || pending_lock_ || pending_passage_on_ || pending_passage_off_) {
         this->parent()->set_enabled(true);
         if (this->parent()->state() == espbt::ClientState::IDLE)
-          this->parent()->connect();
+          this->parent()->set_state(espbt::ClientState::DISCOVERED);
       } else {
         // No pending operations: disable so the scanner can resume.
         // parse_device() will re-enable when the lock next advertises with changed params.
@@ -708,7 +708,7 @@ void TTLockLock::request_update() {
   if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
     start_pending_();
   else if (ble_st == espbt::ClientState::IDLE)
-    this->parent()->connect();
+    this->parent()->set_state(espbt::ClientState::DISCOVERED);
 }
 
 void TTLockLock::set_passage_mode(bool enable) {
@@ -730,7 +730,7 @@ void TTLockLock::set_passage_mode(bool enable) {
   if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
     start_pending_();
   else if (ble_st == espbt::ClientState::IDLE)
-    this->parent()->connect();
+    this->parent()->set_state(espbt::ClientState::DISCOVERED);
 }
 
 // ── lock::Lock interface ─────────────────────────────────────────────────────
@@ -753,7 +753,7 @@ void TTLockLock::control(const lock::LockCall &call) {
       if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
         start_pending_();
       else if (ble_st == espbt::ClientState::IDLE)
-        this->parent()->connect();
+        this->parent()->set_state(espbt::ClientState::DISCOVERED);
     }
 
   } else if (*state == lock::LOCK_STATE_LOCKED) {
@@ -769,7 +769,7 @@ void TTLockLock::control(const lock::LockCall &call) {
       if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
         start_pending_();
       else if (ble_st == espbt::ClientState::IDLE)
-        this->parent()->connect();
+        this->parent()->set_state(espbt::ClientState::DISCOVERED);
     }
   }
 }
@@ -832,14 +832,12 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
     }
 
     // Params changed → trigger a status/passage query connection.
-    // set_enabled(true) is enough: the tracker calls listeners_ before clients_,
-    // so BLEClient::parse_device() runs next (in the same advertisement) and
-    // sees enabled=true → sets DISCOVERED → tracker promotes sequentially.
-    // Calling connect() directly here would bypass that sequencing and cause
-    // both locks to attempt simultaneous connections, hanging the BLE stack.
+    // Use set_state(DISCOVERED) so the tracker stops the scanner before connecting;
+    // calling connect() directly while the scanner is RUNNING leaves scanner_state_
+    // stuck at RUNNING after disconnect, preventing scan restart.
     this->parent()->set_enabled(true);
     if (this->parent()->state() == espbt::ClientState::IDLE)
-      this->parent()->connect();
+      this->parent()->set_state(espbt::ClientState::DISCOVERED);
     return true;
   }
   return false;
