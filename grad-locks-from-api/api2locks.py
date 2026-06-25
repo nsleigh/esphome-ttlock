@@ -1,12 +1,21 @@
 import hashlib
+import io
+import os
 import requests
+import sys
 import time
+from dotenv import load_dotenv
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+load_dotenv()
 
 # ==================== ASSIGN LOGINS HERE ====================
-CLIENT_ID = "YOUR_CLIENT_ID"         # From Developer Panel
-CLIENT_SECRET = "YOUR_CLIENT_SECRET" # From Developer Panel
-USERNAME = "YOUR_USERNAME"           # Your TTLock Phone App Login (Email or Phone)
-PASSWORD = "YOUR_PASSWORD"           # Your TTLock Phone App Password
+# Set these in a .env file in this directory (never commit that file)
+CLIENT_ID     = os.getenv("TTLOCK_CLIENT_ID",     "YOUR_CLIENT_ID")     # From Developer Panel
+CLIENT_SECRET = os.getenv("TTLOCK_CLIENT_SECRET", "YOUR_CLIENT_SECRET") # From Developer Panel
+USERNAME      = os.getenv("TTLOCK_USERNAME",       "YOUR_USERNAME")     # Your TTLock Phone App Login (Email or Phone)
+PASSWORD      = os.getenv("TTLOCK_PASSWORD",       "YOUR_PASSWORD")     # Your TTLock Phone App Password
 # ============================================================
 
 # 1. Generate lowercase 32-character MD5 hex string required by server
@@ -17,7 +26,7 @@ BASE_URL = "https://api.ttlock.com"
 TOKEN_URL = f"{BASE_URL}/oauth2/token"
 KEY_LIST_URL = f"{BASE_URL}/v3/key/list"
 
-print("🔄 Requesting Account API Token from TTLock Platform...")
+print("Requesting Account API Token from TTLock Platform...")
 
 token_payload = {
     "client_id": CLIENT_ID,
@@ -34,19 +43,19 @@ response = requests.post(TOKEN_URL, data=token_payload, headers=headers)
 try:
     token_response = response.json()
 except Exception:
-    print("❌ Critical System Error: Server refused request formatting!")
+    print("ERROR: Critical System Error: Server refused request formatting!")
     print(f"Server Routing Status Code: {response.status_code}")
     print(f"Debug Server String:\n{response.text[:300]}")
     exit()
 
 access_token = token_response.get("access_token")
 if not access_token:
-    print("❌ Failed to Authenticate with Server!")
+    print("ERROR: Failed to Authenticate with Server!")
     print(f"Error Code Message: {token_response}")
     exit()
 
-print("✅ Authentication passed! Access token generated.")
-print("🔄 Reading active lock profiles from your app catalog...\n")
+print("Authentication passed! Access token generated.")
+print("Reading active lock profiles from your app catalog...\n")
 
 # 3. Pull Key List detailing low-level data structures
 current_timestamp_ms = int(time.time() * 1000)
@@ -65,13 +74,13 @@ key_raw_response = requests.post(KEY_LIST_URL, data=key_payload, headers=headers
 try:
     key_response = key_raw_response.json()
 except Exception:
-    print("❌ Error parsing the returned data matrix!")
+    print("ERROR: Error parsing the returned data matrix!")
     print(f"Data Connection Status: {key_raw_response.status_code}")
     exit()
 
 keys = key_response.get("list", [])
 if not keys:
-    print("⚠️ Success, but no device pairings are associated with this token.")
+    print("WARNING: Success, but no device pairings are associated with this token.")
     print(f"Cloud Server Return Block: {key_response}")
     exit()
 

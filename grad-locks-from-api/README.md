@@ -4,7 +4,7 @@ This script extracts lock secrets from the TTLock management API.
 
 ## Steps
 
-1. Update the credentials to match yours:
+1. Update the credentials to match yours (or create .env file):
 
       ```bash
       CLIENT_ID = "YOUR_CLIENT_ID"         # From Developer Panel
@@ -13,7 +13,13 @@ This script extracts lock secrets from the TTLock management API.
       PASSWORD = "YOUR_PASSWORD"           # Your TTLock Phone App Password
       ```
 
-2. Run the script:
+2. Install requirements:
+
+      ```bash
+      pip install -r grad-locks-from-api/requirements.txt
+      ```
+
+3. Run the script:
 
    ```bash
    python3 ./api2locks.py
