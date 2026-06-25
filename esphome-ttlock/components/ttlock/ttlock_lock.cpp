@@ -196,26 +196,7 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
     // BLEClientBase already called set_idle_() before this node handler runs,
     // so state is IDLE here on failure. Trigger reconnect directly — no defer needed.
     case ESP_GATTC_OPEN_EVT:
-      if (param->open.status == ESP_GATT_OK &&
-          write_handle_ != 0 && notify_handle_ != 0 && cccd_handle_ != 0) {
-        // All handles cached from a previous connection.
-        // Write the CCCD descriptor directly (no GATT db lookup needed) to tell the
-        // lock to send notifications.  WRITE_DESCR_EVT fires when the lock ACKs it,
-        // which is our cue to start the protocol — saving the ~1.7 s service discovery wait.
-        ESP_LOGD(TAG, "Cached handles write=0x%04X notify=0x%04X cccd=0x%04X – skipping discovery",
-                 write_handle_, notify_handle_, cccd_handle_);
-        uint8_t cccd_val[] = {0x01, 0x00};
-        esp_err_t err = esp_ble_gattc_write_char_descr(
-            this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
-            cccd_handle_, sizeof(cccd_val), cccd_val,
-            ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
-        if (err == ESP_OK) {
-          handles_were_cached_ = true;
-          notify_subscribed_   = true;
-        } else {
-          ESP_LOGE(TAG, "CCCD write failed: %s", esp_err_to_name(err));
-        }
-      } else if (param->open.status != ESP_GATT_OK && pending_op_ != PendingOp::NONE &&
+      if (param->open.status != ESP_GATT_OK && pending_op_ != PendingOp::NONE &&
           this->parent()->state() == espbt::ClientState::IDLE) {
         ESP_LOGD(TAG, "OPEN_EVT error (status=%d), reconnecting for pending op=%d",
                  param->open.status, (int) pending_op_);
@@ -225,11 +206,6 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
 
     // ── Service discovery complete: look up characteristic handles ───────────
     case ESP_GATTC_SEARCH_CMPL_EVT: {
-      if (handles_were_cached_) {
-        // Already started protocol via CCCD direct-write in OPEN_EVT – ignore.
-        ESP_LOGD(TAG, "Discovery complete (handles already cached, skipping)");
-        break;
-      }
       if (param->search_cmpl.status != ESP_GATT_OK) {
         ESP_LOGE(TAG, "Service search failed: %d", param->search_cmpl.status);
         this->parent()->disconnect();
@@ -245,12 +221,6 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       write_handle_  = chr_write->handle;
       notify_handle_ = chr_notify->handle;
       ESP_LOGD(TAG, "Handles write=0x%04X notify=0x%04X", write_handle_, notify_handle_);
-      // Cache the CCCD descriptor handle so future reconnects can write it directly.
-      auto *cccd = this->parent()->get_descriptor(SERVICE_UUID, NOTIFY_UUID, (uint16_t) 0x2902);
-      if (cccd) {
-        cccd_handle_ = cccd->handle;
-        ESP_LOGD(TAG, "CCCD handle=0x%04X cached", cccd_handle_);
-      }
       esp_err_t err = esp_ble_gattc_register_for_notify(
           this->parent()->get_gattc_if(), this->parent()->get_remote_bda(), notify_handle_);
       if (err != ESP_OK)
@@ -258,21 +228,7 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       break;
     }
 
-    // ── CCCD write confirmed (cached path): start protocol ──────────────────
-    case ESP_GATTC_WRITE_DESCR_EVT:
-      if (notify_subscribed_ && param->write.handle == cccd_handle_) {
-        notify_subscribed_ = false;
-        if (param->write.status == ESP_GATT_OK) {
-          ESP_LOGI(TAG, "BLE ready");
-          start_pending_();
-        } else {
-          ESP_LOGE(TAG, "CCCD write failed status=%d", param->write.status);
-          this->parent()->disconnect();
-        }
-      }
-      break;
-
-    // ── Notify subscription confirmed (first-connection path): start protocol ─
+    // ── Notify subscription confirmed: start protocol ────────────────────────
     case ESP_GATTC_REG_FOR_NOTIFY_EVT:
       if (param->reg_for_notify.status == ESP_GATT_OK) {
         ESP_LOGI(TAG, "BLE ready");
@@ -295,11 +251,9 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
     // For connection failures (reason=0x100) CLOSE_EVT may not follow; those
     // are handled by OPEN_EVT above.
     case ESP_GATTC_DISCONNECT_EVT:
-      // Keep write_handle_ / notify_handle_ / cccd_handle_ so the next OPEN_EVT
-      // can write CCCD directly and skip the ~1.7 s service discovery wait.
-      handles_were_cached_ = false;
-      notify_subscribed_   = false;
-      op_state_            = OpState::IDLE;
+      // write_handle_ / notify_handle_ are intentionally kept so NOTIFY_EVT
+      // filtering works correctly during any overlap with reconnect.
+      op_state_ = OpState::IDLE;
       rx_buf_.clear();
       // 0x100 = ESP_GATT_CONN_CONN_CANCEL: connection-establishment timeout,
       // never follows a completed op. BLEClientBase may auto-connect before

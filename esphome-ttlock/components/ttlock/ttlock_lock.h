@@ -138,12 +138,9 @@ class TTLockLock : public lock::Lock,
   };
 
   // ── BLE characteristic handles ─────────────────────────────────────────
-  // Kept across disconnects so service discovery can be skipped on reconnect.
-  uint16_t write_handle_        {0};
-  uint16_t notify_handle_       {0};
-  uint16_t cccd_handle_         {0};   // CCCD descriptor for notify_handle_
-  bool     handles_were_cached_ {false}; // true when cached path taken this connection
-  bool     notify_subscribed_   {false}; // true while waiting for CCCD write to confirm
+  // Kept across disconnects; used by write_characteristic_() and NOTIFY_EVT filtering.
+  uint16_t write_handle_  {0};
+  uint16_t notify_handle_ {0};
 
   // ── Credentials (from YAML) ────────────────────────────────────────────
   uint32_t    admin_ps_   {0};
