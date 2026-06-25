@@ -138,8 +138,10 @@ class TTLockLock : public lock::Lock,
   };
 
   // ── BLE characteristic handles ─────────────────────────────────────────
-  uint16_t write_handle_  {0};
-  uint16_t notify_handle_ {0};
+  // Kept across disconnects so service discovery can be skipped on reconnect.
+  uint16_t write_handle_       {0};
+  uint16_t notify_handle_      {0};
+  bool     notify_subscribed_  {false};
 
   // ── Credentials (from YAML) ────────────────────────────────────────────
   uint32_t    admin_ps_   {0};

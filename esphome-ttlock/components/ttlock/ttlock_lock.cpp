@@ -196,7 +196,20 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
     // BLEClientBase already called set_idle_() before this node handler runs,
     // so state is IDLE here on failure. Trigger reconnect directly — no defer needed.
     case ESP_GATTC_OPEN_EVT:
-      if (param->open.status != ESP_GATT_OK && pending_op_ != PendingOp::NONE &&
+      if (param->open.status == ESP_GATT_OK && write_handle_ != 0 && notify_handle_ != 0) {
+        // Handles cached from a previous connection — skip the ~1.7 s service discovery
+        // wait and register for notifications immediately. REG_FOR_NOTIFY_EVT is local-only
+        // (no BLE traffic) so it fires instantly, starting the protocol right away.
+        // SEARCH_CMPL_EVT will still arrive ~1.7 s later and is ignored.
+        ESP_LOGD(TAG, "Cached handles write=0x%04X notify=0x%04X – skipping discovery",
+                 write_handle_, notify_handle_);
+        esp_err_t err = esp_ble_gattc_register_for_notify(
+            this->parent()->get_gattc_if(), this->parent()->get_remote_bda(), notify_handle_);
+        if (err == ESP_OK)
+          notify_subscribed_ = true;
+        else
+          ESP_LOGE(TAG, "register_for_notify (cached) failed: %s", esp_err_to_name(err));
+      } else if (param->open.status != ESP_GATT_OK && pending_op_ != PendingOp::NONE &&
           this->parent()->state() == espbt::ClientState::IDLE) {
         ESP_LOGD(TAG, "OPEN_EVT error (status=%d), reconnecting for pending op=%d",
                  param->open.status, (int) pending_op_);
@@ -206,6 +219,11 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
 
     // ── Service discovery complete: look up characteristic handles ───────────
     case ESP_GATTC_SEARCH_CMPL_EVT: {
+      if (notify_subscribed_) {
+        // Already registered via cached handles in OPEN_EVT – nothing to do.
+        ESP_LOGD(TAG, "Discovery complete (handles already cached, skipping)");
+        break;
+      }
       if (param->search_cmpl.status != ESP_GATT_OK) {
         ESP_LOGE(TAG, "Service search failed: %d", param->search_cmpl.status);
         this->parent()->disconnect();
@@ -251,9 +269,10 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
     // For connection failures (reason=0x100) CLOSE_EVT may not follow; those
     // are handled by OPEN_EVT above.
     case ESP_GATTC_DISCONNECT_EVT:
-      write_handle_   = 0;
-      notify_handle_  = 0;
-      op_state_       = OpState::IDLE;
+      // Keep write_handle_ / notify_handle_ so the next OPEN_EVT can skip
+      // service discovery. The handles are stable across reconnects for TTLock.
+      notify_subscribed_ = false;
+      op_state_          = OpState::IDLE;
       rx_buf_.clear();
       // 0x100 = ESP_GATT_CONN_CONN_CANCEL: connection-establishment timeout,
       // never follows a completed op. BLEClientBase may auto-connect before
