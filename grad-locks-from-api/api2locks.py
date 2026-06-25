@@ -89,8 +89,8 @@ for item in keys:
     print(f"MAC Address          : {item.get('lockMac')}")
     print(f"Lock ID (lock_id)    : {item.get('lockId')}")
 
-    # Check all key variable configurations used on regional systems
-    aes_key = item.get('lockKey') or item.get('keyData') or item.get('keyMac')
+    # aesKeyStr is comma-separated hex bytes e.g. "bc,3c,b6,..."
+    aes_key = item.get('aesKeyStr', '').replace(',', '')
 
     print(f"AES Key (lock_key)   : {aes_key}")
     print("=" * 45 + "\n")
