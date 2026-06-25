@@ -42,8 +42,8 @@ load_dotenv()
 # Set these in a .env file in this directory (never commit that file)
 CLIENT_ID     = os.getenv("TTLOCK_CLIENT_ID",     "YOUR_CLIENT_ID")     # From Developer Panel
 CLIENT_SECRET = os.getenv("TTLOCK_CLIENT_SECRET", "YOUR_CLIENT_SECRET") # From Developer Panel
-USERNAME      = os.getenv("TTLOCK_USERNAME",       "YOUR_USERNAME")     # Your TTLock Phone App Login (Email or Phone)
-PASSWORD      = os.getenv("TTLOCK_PASSWORD",       "YOUR_PASSWORD")     # Your TTLock Phone App Password
+USERNAME      = os.getenv("TTLOCK_USERNAME",      "YOUR_USERNAME")     # Your TTLock Phone App Login (Email or Phone)
+PASSWORD      = os.getenv("TTLOCK_PASSWORD",      "YOUR_PASSWORD")     # Your TTLock Phone App Password
 # ============================================================
 
 # 1. Generate lowercase 32-character MD5 hex string required by server
@@ -113,16 +113,16 @@ if not keys:
     exit()
 
 for item in keys:
-    print(f"=== Hardware Found: {item.get('lockName')} ===")
-    print(f"MAC Address            : {item.get('lockMac')}")
-    print(f"Lock ID (lock_id)      : {item.get('lockId')}")
+    print(f"===== Hardware Found: {item.get('lockName')} =====")
+    print(f"MAC Address             : {item.get('lockMac')}")
+    print(f"Lock ID (lock_id)       : {item.get('lockId')}")
 
     # aesKeyStr is comma-separated hex bytes e.g. "bc,3c,b6,..."
     aes_key    = item.get('aesKeyStr', '').replace(',', '')
     admin_ps   = secret2hex(item.get('adminPwd', ''))
     unlock_key = secret2hex(item.get('lockKey', ''))
 
-    print(f"AES Key (lock_key)     : {aes_key}")
-    print(f"Admin PS (admin_ps)    : 0x{admin_ps:08x} ({admin_ps})")
-    print(f"Unlock Key (unlock_key): 0x{unlock_key:08x}")
+    print(f"AES Key (lock_key)      : {aes_key}")
+    print(f"Admin PS (admin_ps)     : 0x{admin_ps:08x}")
+    print(f"Unlock Key (unlock_key) : 0x{unlock_key:08x}")
     print("=" * 45 + "\n")
