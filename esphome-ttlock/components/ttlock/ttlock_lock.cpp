@@ -246,7 +246,7 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       notify_handle_ = chr_notify->handle;
       ESP_LOGD(TAG, "Handles write=0x%04X notify=0x%04X", write_handle_, notify_handle_);
       // Cache the CCCD descriptor handle so future reconnects can write it directly.
-      auto *cccd = this->parent()->get_descriptor(notify_handle_, espbt::ESPBTUUID::from_uint16(0x2902));
+      auto *cccd = this->parent()->get_descriptor(SERVICE_UUID, NOTIFY_UUID, (uint16_t) 0x2902);
       if (cccd) {
         cccd_handle_ = cccd->handle;
         ESP_LOGD(TAG, "CCCD handle=0x%04X cached", cccd_handle_);
