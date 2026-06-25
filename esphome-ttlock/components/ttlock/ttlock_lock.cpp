@@ -5,6 +5,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_gattc_api.h"
+#include "esp_gap_ble_api.h"
 #include "aes/esp_aes.h"
 
 #include <cstring>
@@ -191,6 +192,11 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
                                       esp_gatt_if_t            gattc_if,
                                       esp_ble_gattc_cb_param_t *param) {
   switch (event) {
+
+    // ── HCI connection established: BLE link is up, safe to stop watchdog ───────
+    case ESP_GATTC_CONNECT_EVT:
+      cancel_timeout("conn_wdog");
+      break;
 
     // ── Connection open (possibly failed) ────────────────────────────────────
     // BLEClientBase already called set_idle_() before this node handler runs,
@@ -616,7 +622,26 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
 // it fires, either the BLEClient is IDLE (reconnect and re-arm) or it is stuck
 // in CONNECTING/DISCONNECTING (clear ops; publish JAMMED only for user-initiated ops).
 
+// Cancel and restart the 15 s connection watchdog.  Called every time a
+// connection attempt begins.  CONNECT_EVT cancels it early on success; if
+// 15 s pass with the BLE stack still in CONNECTING state (typical after a
+// 0x3e HCI failure where the BT controller gives up at ~1.7 s but the GATTC
+// layer waits the full 18 s before reporting), we call cancel_connect to
+// abort immediately and let the existing retry logic reconnect.
+void TTLockLock::arm_conn_watchdog_() {
+  cancel_timeout("conn_wdog");
+  set_timeout("conn_wdog", 15000, [this]() {
+    if (pending_op_ == PendingOp::NONE) return;
+    auto st = this->parent()->state();
+    if (st == espbt::ClientState::CONNECTING || st == espbt::ClientState::IDLE) {
+      ESP_LOGW(TAG, "Connection watchdog fired – cancelling stuck BLE attempt (state=%d)", (int) st);
+      esp_ble_gap_cancel_connect(this->parent()->get_remote_bda());
+    }
+  });
+}
+
 void TTLockLock::arm_op_watchdog_() {
+  arm_conn_watchdog_();
   cancel_timeout("op_wdog");
   set_timeout("op_wdog", 90000, [this]() {
     if (pending_op_ == PendingOp::NONE)
