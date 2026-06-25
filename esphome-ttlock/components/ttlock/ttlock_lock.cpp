@@ -626,16 +626,16 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
 // connection attempt begins.  CONNECT_EVT cancels it early on success; if
 // 15 s pass with the BLE stack still in CONNECTING state (typical after a
 // 0x3e HCI failure where the BT controller gives up at ~1.7 s but the GATTC
-// layer waits the full 18 s before reporting), we call cancel_connect to
-// abort immediately and let the existing retry logic reconnect.
+// layer waits the full 18 s before reporting), we call esp_ble_gap_disconnect
+// to abort immediately and let the existing retry logic reconnect.
 void TTLockLock::arm_conn_watchdog_() {
   cancel_timeout("conn_wdog");
   set_timeout("conn_wdog", 15000, [this]() {
     if (pending_op_ == PendingOp::NONE) return;
     auto st = this->parent()->state();
     if (st == espbt::ClientState::CONNECTING || st == espbt::ClientState::IDLE) {
-      ESP_LOGW(TAG, "Connection watchdog fired – cancelling stuck BLE attempt (state=%d)", (int) st);
-      esp_ble_gap_cancel_connect(this->parent()->get_remote_bda());
+      ESP_LOGW(TAG, "Connection watchdog fired – disconnecting stuck BLE attempt (state=%d)", (int) st);
+      esp_ble_gap_disconnect(this->parent()->get_remote_bda());
     }
   });
 }
