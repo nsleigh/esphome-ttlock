@@ -12,7 +12,7 @@ This is a set of projects related to using TTLock locks locally with ESPHome.
   A script to extract lock secrets from the TTLock app database.
   Requires a rooted phone or emulator.
 
-- **grad-locks-from-api**
+- **grab-locks-from-api**
   A script to extract lock secrets (MAC address and AES key) via the TTLock management API.
   No rooted device needed — requires a TTLock developer account and your app credentials.
 

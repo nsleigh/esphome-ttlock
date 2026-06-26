@@ -16,7 +16,7 @@ This script extracts lock secrets from the TTLock management API.
 2. Install requirements:
 
     ```bash
-    pip install -r grad-locks-from-api/requirements.txt
+    pip install -r grab-locks-from-api/requirements.txt
     ```
 
 3. Run the script:
