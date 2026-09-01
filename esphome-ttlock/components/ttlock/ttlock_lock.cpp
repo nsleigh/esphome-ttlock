@@ -259,7 +259,9 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       // never follows a completed op. BLEClientBase may auto-connect before
       // parse_device runs (leaving pending_op_==NONE). Treat as QUERY so that
       // the reconnect paths below activate instead of calling set_enabled(false).
-      if (param->disconnect.reason == 0x0100 && pending_op_ == PendingOp::NONE)
+      // Skip if disabled: that auto-connect race can't happen then, and it'd undo the watchdog's abandonment.
+      if (param->disconnect.reason == 0x0100 && pending_op_ == PendingOp::NONE &&
+          this->parent()->enabled)
         pending_op_ = PendingOp::QUERY;
       if (pending_op_ != PendingOp::NONE) {
         // Don't reset the watchdog on connection-establishment failures (reason=0x100):
