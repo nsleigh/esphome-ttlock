@@ -259,10 +259,17 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       // never follows a completed op. BLEClientBase may auto-connect before
       // parse_device runs (leaving pending_op_==NONE). Treat as QUERY so that
       // the reconnect paths below activate instead of calling set_enabled(false).
-      if (param->disconnect.reason == 0x0100 && pending_op_ == PendingOp::NONE)
+      // Skip if disabled: that auto-connect race can't happen then, and it'd undo the watchdog's abandonment.
+      if (param->disconnect.reason == 0x0100 && pending_op_ == PendingOp::NONE &&
+          this->parent()->enabled)
         pending_op_ = PendingOp::QUERY;
       if (pending_op_ != PendingOp::NONE) {
-        arm_op_watchdog_();
+        // Don't reset the watchdog on connection-establishment failures (reason=0x100):
+        // control()/set_passage_mode() already armed it, and resetting it every 20 s
+        // (the BLE connection timeout) would prevent it from ever firing.
+        // For mid-operation disconnects (other reasons) do re-arm — the op restarts.
+        if (param->disconnect.reason != 0x0100)
+          arm_op_watchdog_();
         this->parent()->set_enabled(true);
         // For connection failures (reason=0x100) CLOSE_EVT may not fire.
         // The OPEN_EVT handler triggers reconnect synchronously, but a UART-flush
