@@ -138,6 +138,7 @@ class TTLockLock : public lock::Lock,
   };
 
   // ── BLE characteristic handles ─────────────────────────────────────────
+  // Kept across disconnects; used by write_characteristic_() and NOTIFY_EVT filtering.
   uint16_t write_handle_  {0};
   uint16_t notify_handle_ {0};
 
@@ -179,6 +180,7 @@ class TTLockLock : public lock::Lock,
   void handle_response_(uint8_t cmd, const std::vector<uint8_t> &payload);
 
   // ── Lock/unlock sequence ───────────────────────────────────────────────
+  void arm_conn_watchdog_();
   void arm_op_watchdog_();
   void start_pending_();
   void do_query_status_();

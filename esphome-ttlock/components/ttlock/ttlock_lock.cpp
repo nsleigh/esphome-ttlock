@@ -5,8 +5,10 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_gattc_api.h"
+#include "esp_gap_ble_api.h"
 #include "aes/esp_aes.h"
 
+#include <cinttypes>
 #include <cstring>
 #include <ctime>
 #include <algorithm>
@@ -119,7 +121,8 @@ void TTLockLock::send_cmd_(uint8_t cmd, const uint8_t *payload, size_t payload_l
   pkt[n++] = (uint8_t) enc_len;
   memcpy(pkt + n, enc, enc_len);
   n += enc_len;
-  pkt[n++] = crc8_(pkt, n);   // CRC of everything up to here
+  uint8_t crc = crc8_(pkt, n);   // CRC of everything up to here
+  pkt[n++] = crc;
   pkt[n++] = PKT_CRLF0;
   pkt[n++] = PKT_CRLF1;
 
@@ -192,6 +195,11 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
                                       esp_ble_gattc_cb_param_t *param) {
   switch (event) {
 
+    // ── HCI connection established: BLE link is up, safe to stop watchdog ───────
+    case ESP_GATTC_CONNECT_EVT:
+      cancel_timeout("conn_wdog");
+      break;
+
     // ── Connection open (possibly failed) ────────────────────────────────────
     // BLEClientBase already called set_idle_() before this node handler runs,
     // so state is IDLE here on failure. Trigger reconnect directly — no defer needed.
@@ -251,9 +259,9 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
     // For connection failures (reason=0x100) CLOSE_EVT may not follow; those
     // are handled by OPEN_EVT above.
     case ESP_GATTC_DISCONNECT_EVT:
-      write_handle_   = 0;
-      notify_handle_  = 0;
-      op_state_       = OpState::IDLE;
+      // write_handle_ / notify_handle_ are intentionally kept so NOTIFY_EVT
+      // filtering works correctly during any overlap with reconnect.
+      op_state_ = OpState::IDLE;
       rx_buf_.clear();
       // 0x100 = ESP_GATT_CONN_CONN_CANCEL: connection-establishment timeout,
       // never follows a completed op. BLEClientBase may auto-connect before
@@ -268,8 +276,11 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
         // control()/set_passage_mode() already armed it, and resetting it every 20 s
         // (the BLE connection timeout) would prevent it from ever firing.
         // For mid-operation disconnects (other reasons) do re-arm — the op restarts.
+        // A new connection attempt follows either way, so keep the conn watchdog armed.
         if (param->disconnect.reason != 0x0100)
           arm_op_watchdog_();
+        else
+          arm_conn_watchdog_();
         this->parent()->set_enabled(true);
         // For connection failures (reason=0x100) CLOSE_EVT may not fire.
         // The OPEN_EVT handler triggers reconnect synchronously, but a UART-flush
@@ -523,11 +534,11 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
           if (data.size() >= 3) {
             uint8_t battery = data[2];
-            ESP_LOGI(TAG, "Unlocked  battery=%d%%  elapsed=%ums", battery, elapsed_ms);
+            ESP_LOGI(TAG, "Unlocked  battery=%d%%  elapsed=%" PRIu32 "ms", battery, elapsed_ms);
             if (battery_sensor_)
               battery_sensor_->publish_state((float) battery);
           } else {
-            ESP_LOGI(TAG, "Unlocked  elapsed=%ums", elapsed_ms);
+            ESP_LOGI(TAG, "Unlocked  elapsed=%" PRIu32 "ms", elapsed_ms);
           }
           this->publish_state(lock::LOCK_STATE_UNLOCKED);
           if (passage_switch_)
@@ -535,12 +546,12 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           this->parent()->set_enabled(false);  // done – stop auto-reconnect
         } else {
           if (++retry_count_ < MAX_RETRIES) {
-            ESP_LOGW(TAG, "Unlock rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
+            ESP_LOGW(TAG, "Unlock rejected (status=0x%02X) – retry %d/%d  elapsed=%" PRIu32 "ms",
                      status, retry_count_, MAX_RETRIES, elapsed_ms);
             this->publish_state(lock::LOCK_STATE_LOCKED);
             // pending_op_ stays UNLOCK; DISCONNECT_EVT will reconnect
           } else {
-            ESP_LOGE(TAG, "Unlock failed after %d retries – giving up  elapsed=%ums",
+            ESP_LOGE(TAG, "Unlock failed after %d retries – giving up  elapsed=%" PRIu32 "ms",
                      MAX_RETRIES, elapsed_ms);
             pending_op_  = PendingOp::NONE;
             retry_count_ = 0;
@@ -562,11 +573,11 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
           if (data.size() >= 3) {
             uint8_t battery = data[2];
-            ESP_LOGI(TAG, "Locked  battery=%d%%  elapsed=%ums", battery, elapsed_ms);
+            ESP_LOGI(TAG, "Locked  battery=%d%%  elapsed=%" PRIu32 "ms", battery, elapsed_ms);
             if (battery_sensor_)
               battery_sensor_->publish_state((float) battery);
           } else {
-            ESP_LOGI(TAG, "Locked  elapsed=%ums", elapsed_ms);
+            ESP_LOGI(TAG, "Locked  elapsed=%" PRIu32 "ms", elapsed_ms);
           }
           this->publish_state(lock::LOCK_STATE_LOCKED);
           if (passage_switch_)
@@ -574,12 +585,12 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           this->parent()->set_enabled(false);  // done – stop auto-reconnect
         } else {
           if (++retry_count_ < MAX_RETRIES) {
-            ESP_LOGW(TAG, "Lock rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
+            ESP_LOGW(TAG, "Lock rejected (status=0x%02X) – retry %d/%d  elapsed=%" PRIu32 "ms",
                      status, retry_count_, MAX_RETRIES, elapsed_ms);
             this->publish_state(lock::LOCK_STATE_UNLOCKED);
             // pending_op_ stays LOCK; DISCONNECT_EVT will reconnect
           } else {
-            ESP_LOGE(TAG, "Lock failed after %d retries – giving up  elapsed=%ums",
+            ESP_LOGE(TAG, "Lock failed after %d retries – giving up  elapsed=%" PRIu32 "ms",
                      MAX_RETRIES, elapsed_ms);
             pending_op_  = PendingOp::NONE;
             retry_count_ = 0;
@@ -623,7 +634,26 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
 // it fires, either the BLEClient is IDLE (reconnect and re-arm) or it is stuck
 // in CONNECTING/DISCONNECTING (clear ops; publish JAMMED only for user-initiated ops).
 
+// Cancel and restart the 15 s connection watchdog.  Called every time a
+// connection attempt begins.  CONNECT_EVT cancels it early on success; if
+// 15 s pass with the BLE stack still in CONNECTING state (typical after a
+// 0x3e HCI failure where the BT controller gives up at ~1.7 s but the GATTC
+// layer waits the full 18 s before reporting), we call esp_ble_gap_disconnect
+// to abort immediately and let the existing retry logic reconnect.
+void TTLockLock::arm_conn_watchdog_() {
+  cancel_timeout("conn_wdog");
+  set_timeout("conn_wdog", 15000, [this]() {
+    if (pending_op_ == PendingOp::NONE) return;
+    auto st = this->parent()->state();
+    if (st == espbt::ClientState::CONNECTING || st == espbt::ClientState::IDLE) {
+      ESP_LOGW(TAG, "Connection watchdog fired – disconnecting stuck BLE attempt (state=%d)", (int) st);
+      esp_ble_gap_disconnect(this->parent()->get_remote_bda());
+    }
+  });
+}
+
 void TTLockLock::arm_op_watchdog_() {
+  arm_conn_watchdog_();
   cancel_timeout("op_wdog");
   set_timeout("op_wdog", 90000, [this]() {
     if (pending_op_ == PendingOp::NONE)
@@ -868,7 +898,7 @@ void TTLockLock::setup() {
 
 bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
   // Only handle our lock
-  if (device.address_str() != this->parent()->address_str())
+  if (device.address_uint64() != this->parent()->get_address())
     return false;
 
   for (const auto &mfr : device.get_manufacturer_datas()) {
@@ -900,7 +930,7 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
     if ((state == adv_state) && (pending_op_ == PendingOp::NONE))
       return false;
 
-    ESP_LOGI(TAG, "[%s] ADV params=0x%02X -> %s, current state -> %s", device.address_str().c_str(), params, lock::lock_state_to_string(adv_state), lock::lock_state_to_string(state));
+    ESP_LOGI(TAG, "[%s] ADV params=0x%02X -> %s, current state -> %s", this->parent()->address_str(), params, LOG_STR_ARG(lock::lock_state_to_string(adv_state)), LOG_STR_ARG(lock::lock_state_to_string(state)));
 
     // Don't overwrite state mid-operation (GATTC sequence is authoritative)
     if ((pending_op_ == PendingOp::NONE) || (pending_op_ == PendingOp::QUERY)) {

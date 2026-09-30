@@ -60,7 +60,7 @@ CONFIG_SCHEMA = cv.All(
             # ── Credentials (required) ────────────────────────────────────────
             cv.Required(CONF_ADMIN_PS):   cv.int_range(min=1, max=0x7FFFFFFF),
             cv.Required(CONF_UNLOCK_KEY): cv.int_range(min=1, max=0x7FFFFFFF),
-            cv.Required(CONF_AES_KEY):    _validate_aes_key,
+            cv.Required(CONF_AES_KEY):    cv.sensitive(_validate_aes_key),
 
             # ── Protocol version ──────────────────────────────────────────────
             cv.Optional(CONF_PROTO_TYPE, default=0x05): cv.hex_uint8_t,
