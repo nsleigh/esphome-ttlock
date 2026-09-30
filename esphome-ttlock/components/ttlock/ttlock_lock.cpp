@@ -7,6 +7,7 @@
 #include "esp_gattc_api.h"
 #include "aes/esp_aes.h"
 
+#include <cinttypes>
 #include <cstring>
 #include <ctime>
 #include <algorithm>
@@ -119,7 +120,8 @@ void TTLockLock::send_cmd_(uint8_t cmd, const uint8_t *payload, size_t payload_l
   pkt[n++] = (uint8_t) enc_len;
   memcpy(pkt + n, enc, enc_len);
   n += enc_len;
-  pkt[n++] = crc8_(pkt, n);   // CRC of everything up to here
+  uint8_t crc = crc8_(pkt, n);   // CRC of everything up to here
+  pkt[n++] = crc;
   pkt[n++] = PKT_CRLF0;
   pkt[n++] = PKT_CRLF1;
 
@@ -523,11 +525,11 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
           if (data.size() >= 3) {
             uint8_t battery = data[2];
-            ESP_LOGI(TAG, "Unlocked  battery=%d%%  elapsed=%ums", battery, elapsed_ms);
+            ESP_LOGI(TAG, "Unlocked  battery=%d%%  elapsed=%" PRIu32 "ms", battery, elapsed_ms);
             if (battery_sensor_)
               battery_sensor_->publish_state((float) battery);
           } else {
-            ESP_LOGI(TAG, "Unlocked  elapsed=%ums", elapsed_ms);
+            ESP_LOGI(TAG, "Unlocked  elapsed=%" PRIu32 "ms", elapsed_ms);
           }
           this->publish_state(lock::LOCK_STATE_UNLOCKED);
           if (passage_switch_)
@@ -535,12 +537,12 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           this->parent()->set_enabled(false);  // done – stop auto-reconnect
         } else {
           if (++retry_count_ < MAX_RETRIES) {
-            ESP_LOGW(TAG, "Unlock rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
+            ESP_LOGW(TAG, "Unlock rejected (status=0x%02X) – retry %d/%d  elapsed=%" PRIu32 "ms",
                      status, retry_count_, MAX_RETRIES, elapsed_ms);
             this->publish_state(lock::LOCK_STATE_LOCKED);
             // pending_op_ stays UNLOCK; DISCONNECT_EVT will reconnect
           } else {
-            ESP_LOGE(TAG, "Unlock failed after %d retries – giving up  elapsed=%ums",
+            ESP_LOGE(TAG, "Unlock failed after %d retries – giving up  elapsed=%" PRIu32 "ms",
                      MAX_RETRIES, elapsed_ms);
             pending_op_  = PendingOp::NONE;
             retry_count_ = 0;
@@ -562,11 +564,11 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
           if (data.size() >= 3) {
             uint8_t battery = data[2];
-            ESP_LOGI(TAG, "Locked  battery=%d%%  elapsed=%ums", battery, elapsed_ms);
+            ESP_LOGI(TAG, "Locked  battery=%d%%  elapsed=%" PRIu32 "ms", battery, elapsed_ms);
             if (battery_sensor_)
               battery_sensor_->publish_state((float) battery);
           } else {
-            ESP_LOGI(TAG, "Locked  elapsed=%ums", elapsed_ms);
+            ESP_LOGI(TAG, "Locked  elapsed=%" PRIu32 "ms", elapsed_ms);
           }
           this->publish_state(lock::LOCK_STATE_LOCKED);
           if (passage_switch_)
@@ -574,12 +576,12 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           this->parent()->set_enabled(false);  // done – stop auto-reconnect
         } else {
           if (++retry_count_ < MAX_RETRIES) {
-            ESP_LOGW(TAG, "Lock rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
+            ESP_LOGW(TAG, "Lock rejected (status=0x%02X) – retry %d/%d  elapsed=%" PRIu32 "ms",
                      status, retry_count_, MAX_RETRIES, elapsed_ms);
             this->publish_state(lock::LOCK_STATE_UNLOCKED);
             // pending_op_ stays LOCK; DISCONNECT_EVT will reconnect
           } else {
-            ESP_LOGE(TAG, "Lock failed after %d retries – giving up  elapsed=%ums",
+            ESP_LOGE(TAG, "Lock failed after %d retries – giving up  elapsed=%" PRIu32 "ms",
                      MAX_RETRIES, elapsed_ms);
             pending_op_  = PendingOp::NONE;
             retry_count_ = 0;
