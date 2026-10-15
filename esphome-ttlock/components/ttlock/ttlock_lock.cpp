@@ -18,6 +18,13 @@ namespace ttlock {
 
 static const char *const TAG = "ttlock";
 
+// Prefix every line with this lock's MAC so multi-lock logs stay readable.
+// Use only inside non-static TTLockLock members (needs `this`).
+#define TLOG(level, fmt, ...) ESP_LOG##level(TAG, "[%s] " fmt, this->parent()->address_str(), ##__VA_ARGS__)
+
+TTLockLock              *TTLockLock::active_lock_ = nullptr;
+std::vector<TTLockLock *> TTLockLock::queue_;
+
 // ── CRC-8 Dallas / Maxim ────────────────────────────────────────────────────
 
 static const uint8_t DSCRC[256] = {
@@ -38,6 +45,17 @@ static const uint8_t DSCRC[256] = {
     233, 183,  85,  11, 136, 214,  52, 106,  43, 117, 151, 201,  74,  20, 246, 168,
     116,  42, 200, 150,  21,  75, 169, 247, 182, 232,  10,  84, 215, 137, 107,  53,
 };
+
+static inline void put_u32_be(uint8_t *buf, uint32_t v) {
+  buf[0] = (v >> 24) & 0xFF;
+  buf[1] = (v >> 16) & 0xFF;
+  buf[2] = (v >>  8) & 0xFF;
+  buf[3] =  v        & 0xFF;
+}
+
+static inline uint32_t get_u32_be(const uint8_t *p) {
+  return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) | ((uint32_t) p[2] << 8) | (uint32_t) p[3];
+}
 
 uint8_t TTLockLock::crc8_(const uint8_t *data, size_t len) {
   uint8_t crc = 0;
@@ -121,12 +139,12 @@ void TTLockLock::send_cmd_(uint8_t cmd, const uint8_t *payload, size_t payload_l
   pkt[n++] = (uint8_t) enc_len;
   memcpy(pkt + n, enc, enc_len);
   n += enc_len;
-  uint8_t crc = crc8_(pkt, n);   // CRC of everything up to here
-  pkt[n++] = crc;
+  pkt[n] = crc8_(pkt, n);   // CRC of everything up to here
+  n++;
   pkt[n++] = PKT_CRLF0;
   pkt[n++] = PKT_CRLF1;
 
-  ESP_LOGV(TAG, "TX cmd=0x%02X total=%d enc=%d", cmd, n, enc_len);
+  TLOG(V, "TX cmd=0x%02X total=%d enc=%d", cmd, n, enc_len);
 
   // Write in MTU_SIZE chunks with response confirmation
   for (size_t off = 0; off < n; off += MTU_SIZE) {
@@ -140,7 +158,7 @@ void TTLockLock::send_cmd_(uint8_t cmd, const uint8_t *payload, size_t payload_l
         ESP_GATT_WRITE_TYPE_RSP,
         ESP_GATT_AUTH_REQ_NONE);
     if (err != ESP_OK) {
-      ESP_LOGE(TAG, "gattc_write_char failed: %s", esp_err_to_name(err));
+      TLOG(E, "gattc_write_char failed: %s", esp_err_to_name(err));
       return;
     }
   }
@@ -151,11 +169,11 @@ void TTLockLock::send_cmd_(uint8_t cmd, const uint8_t *payload, size_t payload_l
 bool TTLockLock::parse_pkt_(const uint8_t *raw, size_t len,
                               uint8_t &cmd_out, std::vector<uint8_t> &data_out) {
   if (len < PKT_OVERHEAD) {
-    ESP_LOGW(TAG, "Packet too short: %d", len);
+    TLOG(W, "Packet too short: %d", len);
     return false;
   }
   if (raw[0] != PKT_HDR0 || raw[1] != PKT_HDR1) {
-    ESP_LOGW(TAG, "Bad header: %02X %02X", raw[0], raw[1]);
+    TLOG(W, "Bad header: %02X %02X", raw[0], raw[1]);
     return false;
   }
 
@@ -163,7 +181,7 @@ bool TTLockLock::parse_pkt_(const uint8_t *raw, size_t len,
   uint8_t enc_len = raw[11];
 
   if (len < (size_t)(PKT_OVERHEAD + enc_len)) {
-    ESP_LOGW(TAG, "Truncated packet: need %d got %d", PKT_OVERHEAD + enc_len, len);
+    TLOG(W, "Truncated packet: need %d got %d", PKT_OVERHEAD + enc_len, len);
     return false;
   }
 
@@ -174,7 +192,7 @@ bool TTLockLock::parse_pkt_(const uint8_t *raw, size_t len,
   size_t  body_end = 12 + enc_len;
   uint8_t expected = crc8_(raw, body_end);
   if (raw[body_end] != expected) {
-    ESP_LOGW(TAG, "CRC mismatch: got 0x%02X expected 0x%02X (continuing – TTLock quirk)",
+    TLOG(W, "CRC mismatch: got 0x%02X expected 0x%02X (continuing – TTLock quirk)",
              raw[body_end], expected);
   }
 
@@ -202,47 +220,48 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
 
     // ── Connection open (possibly failed) ────────────────────────────────────
     // BLEClientBase already called set_idle_() before this node handler runs,
-    // so state is IDLE here on failure. Trigger reconnect directly — no defer needed.
+    // so it's back to IDLE here on failure. With auto_connect on (the ble_client
+    // default), BLEClientBase::parse_device() will pick the device back up itself
+    // on its next advertisement as long as we stay enabled — nothing to do here.
     case ESP_GATTC_OPEN_EVT:
-      if (param->open.status != ESP_GATT_OK && pending_op_ != PendingOp::NONE &&
-          this->parent()->state() == espbt::ClientState::IDLE) {
-        ESP_LOGD(TAG, "OPEN_EVT error (status=%d), reconnecting for pending op=%d",
+      if (param->open.status != ESP_GATT_OK && pending_op_ != PendingOp::NONE && !yielded_) {
+        TLOG(D, "OPEN_EVT error (status=%d), retrying (pending op=%d)",
                  param->open.status, (int) pending_op_);
-        this->parent()->set_state(espbt::ClientState::DISCOVERED);
+        drive_connect_();  // fast_connect: reconnect now; else wait for next advertisement
       }
       break;
 
     // ── Service discovery complete: look up characteristic handles ───────────
     case ESP_GATTC_SEARCH_CMPL_EVT: {
       if (param->search_cmpl.status != ESP_GATT_OK) {
-        ESP_LOGE(TAG, "Service search failed: %d", param->search_cmpl.status);
+        TLOG(E, "Service search failed: %d", param->search_cmpl.status);
         this->parent()->disconnect();
         break;
       }
       auto *chr_write  = this->parent()->get_characteristic(SERVICE_UUID, WRITE_UUID);
       auto *chr_notify = this->parent()->get_characteristic(SERVICE_UUID, NOTIFY_UUID);
       if (!chr_write || !chr_notify) {
-        ESP_LOGE(TAG, "TTLock service/characteristics missing – is this a TTLock?");
+        TLOG(E, "TTLock service/characteristics missing – is this a TTLock?");
         this->parent()->disconnect();
         break;
       }
       write_handle_  = chr_write->handle;
       notify_handle_ = chr_notify->handle;
-      ESP_LOGD(TAG, "Handles write=0x%04X notify=0x%04X", write_handle_, notify_handle_);
+      TLOG(D, "Handles write=0x%04X notify=0x%04X", write_handle_, notify_handle_);
       esp_err_t err = esp_ble_gattc_register_for_notify(
           this->parent()->get_gattc_if(), this->parent()->get_remote_bda(), notify_handle_);
       if (err != ESP_OK)
-        ESP_LOGE(TAG, "register_for_notify failed: %s", esp_err_to_name(err));
+        TLOG(E, "register_for_notify failed: %s", esp_err_to_name(err));
       break;
     }
 
     // ── Notify subscription confirmed: start protocol ────────────────────────
     case ESP_GATTC_REG_FOR_NOTIFY_EVT:
       if (param->reg_for_notify.status == ESP_GATT_OK) {
-        ESP_LOGI(TAG, "BLE ready");
+        TLOG(I, "BLE ready");
         start_pending_();
       } else {
-        ESP_LOGE(TAG, "register_for_notify status=%d", param->reg_for_notify.status);
+        TLOG(E, "register_for_notify status=%d", param->reg_for_notify.status);
         this->parent()->disconnect();
       }
       break;
@@ -255,9 +274,8 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
 
     // ── Disconnected: protocol cleanup only ──────────────────────────────────
     // Do NOT publish UNKNOWN – keep the last known state to avoid HA flicker.
-    // Reconnect decisions are made in CLOSE_EVT (state guaranteed IDLE there).
-    // For connection failures (reason=0x100) CLOSE_EVT may not follow; those
-    // are handled by OPEN_EVT above.
+    // Reconnecting (if pending_op_ is still set) just means staying enabled;
+    // BLEClientBase::parse_device() re-discovers the device on its own.
     case ESP_GATTC_DISCONNECT_EVT:
       // write_handle_ / notify_handle_ are intentionally kept so NOTIFY_EVT
       // filtering works correctly during any overlap with reconnect.
@@ -265,13 +283,15 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       rx_buf_.clear();
       // 0x100 = ESP_GATT_CONN_CONN_CANCEL: connection-establishment timeout,
       // never follows a completed op. BLEClientBase may auto-connect before
-      // parse_device runs (leaving pending_op_==NONE). Treat as QUERY so that
-      // the reconnect paths below activate instead of calling set_enabled(false).
+      // parse_device runs (leaving pending_op_==NONE). Treat as QUERY so we
+      // stay enabled instead of calling finish_op_() on a slot we never held.
       // Skip if disabled: that auto-connect race can't happen then, and it'd undo the watchdog's abandonment.
       if (param->disconnect.reason == 0x0100 && pending_op_ == PendingOp::NONE &&
           this->parent()->enabled)
         pending_op_ = PendingOp::QUERY;
-      if (pending_op_ != PendingOp::NONE) {
+      // Skip while yielded: this is a straggler from the connection attempt we
+      // just aborted in yield_slot_() — re-enabling here would undo the preemption.
+      if (pending_op_ != PendingOp::NONE && !yielded_) {
         // Don't reset the watchdog on connection-establishment failures (reason=0x100):
         // control()/set_passage_mode() already armed it, and resetting it every 20 s
         // (the BLE connection timeout) would prevent it from ever firing.
@@ -282,30 +302,15 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
         else
           arm_conn_watchdog_();
         this->parent()->set_enabled(true);
-        // For connection failures (reason=0x100) CLOSE_EVT may not fire.
-        // The OPEN_EVT handler triggers reconnect synchronously, but a UART-flush
-        // delay between BLEClientBase log lines can allow the tracker's loop() to
-        // start the scanner before OPEN_EVT is fully processed. run_later fires at
-        // the end of this loop iteration when OPEN_EVT has settled and state is IDLE.
-        // If OPEN_EVT already triggered reconnect (state=CONNECTING), this is a no-op.
-        this->parent()->run_later([this]() {
-          if (pending_op_ != PendingOp::NONE &&
-              this->parent()->state() == espbt::ClientState::IDLE)
-            this->parent()->set_state(espbt::ClientState::DISCOVERED);
-        });
       }
       break;
 
-    // ── BLE stack fully cleaned up: make reconnect decision ──────────────────
-    // BLEClientBase called set_idle_() before our handler runs, so state is
-    // guaranteed IDLE here. No run_later needed.
-    // Not fired for connection failures (reason=0x100) — OPEN_EVT covers that.
+    // ── BLE stack fully cleaned up: release the radio if we're done ──────────
     case ESP_GATTC_CLOSE_EVT:
-      if (pending_op_ != PendingOp::NONE) {
-        this->parent()->set_state(espbt::ClientState::DISCOVERED);
-      } else {
-        this->parent()->set_enabled(false);
-      }
+      if (pending_op_ == PendingOp::NONE)
+        finish_op_();
+      else if (!yielded_)
+        drive_connect_();  // fast_connect: reconnect now; else wait for next advertisement
       break;
 
     default:
@@ -345,7 +350,7 @@ void TTLockLock::on_ble_data_(const uint8_t *data, uint16_t len) {
 
   // Guard against runaway buffer growth (e.g. lock sends garbage)
   if (rx_buf_.size() > 512) {
-    ESP_LOGW(TAG, "RX buffer overflow, clearing");
+    TLOG(W, "RX buffer overflow, clearing");
     rx_buf_.clear();
   }
 }
@@ -359,7 +364,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
   uint8_t cmd    = data.size() >= 1 ? data[0] : raw_cmd;
   uint8_t status = data.size() >= 2 ? data[1] : 0xFF;
 
-  ESP_LOGD(TAG, "RX cmd=0x%02X status=0x%02X len=%d op=%d",
+  TLOG(D, "RX cmd=0x%02X status=0x%02X len=%d op=%d",
            cmd, status, data.size(), (int) op_state_);
 
   switch (op_state_) {
@@ -371,14 +376,17 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         // data[3] = LockedStatus: 0 = LOCKED, 1 = UNLOCKED (JS SDK convention)
         last_status_unlocked_ = (data[3] == 1);
         if (last_status_unlocked_) {
-          ESP_LOGI(TAG, "Lock status: UNLOCKED");
+          TLOG(I, "Lock status: UNLOCKED");
           this->publish_state(lock::LOCK_STATE_UNLOCKED);
         } else {
-          ESP_LOGI(TAG, "Lock status: LOCKED");
+          TLOG(I, "Lock status: LOCKED");
           this->publish_state(lock::LOCK_STATE_LOCKED);
         }
         // Always follow with a passage mode query so passage_mode_ stays in sync.
         do_check_admin_();
+      } else {
+        TLOG(E, "Unexpected response in QUERY_STATUS (cmd=0x%02X)", cmd);
+        end_op_();
       }
       break;
 
@@ -387,17 +395,14 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
     case OpState::CHECK_ADMIN:
       if (cmd == CMD_CHECK_ADMIN && data.size() >= 6) {
         // psFromLock is at data[2..5] (after cmd type byte + status byte)
-        ps_from_lock_ = ((uint32_t) data[2] << 24) | ((uint32_t) data[3] << 16) |
-                        ((uint32_t) data[4] <<  8) |  (uint32_t) data[5];
-        ESP_LOGD(TAG, "CHECK_ADMIN: got token from lock");
+        ps_from_lock_ = get_u32_be(&data[2]);
+        TLOG(D, "CHECK_ADMIN: got token from lock");
         op_state_ = OpState::CHECK_RANDOM;
         do_check_random_();
       } else {
-        ESP_LOGE(TAG, "CHECK_ADMIN failed (cmd=0x%02X status=0x%02X len=%d)",
+        TLOG(E, "CHECK_ADMIN failed (cmd=0x%02X status=0x%02X len=%d)",
                  cmd, status, data.size());
-        op_state_   = OpState::IDLE;
-        pending_op_ = PendingOp::NONE;
-        this->publish_state(lock::LOCK_STATE_JAMMED);
+        end_op_(lock::LOCK_STATE_JAMMED);
       }
       break;
 
@@ -424,47 +429,22 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
             break;
         }
       } else {
-        ESP_LOGE(TAG, "CHECK_RANDOM failed (cmd=0x%02X status=0x%02X)", cmd, status);
-        op_state_   = OpState::IDLE;
-        pending_op_ = PendingOp::NONE;
-        this->publish_state(lock::LOCK_STATE_JAMMED);
+        TLOG(E, "CHECK_RANDOM failed (cmd=0x%02X status=0x%02X)", cmd, status);
+        end_op_(lock::LOCK_STATE_JAMMED);
       }
       break;
 
     case OpState::CHECK_USER_TIME_CMD:
       if (cmd == CMD_CHECK_USER_TIME && status == 0x01 && data.size() >= 6) {
-        // Fresh ps_from_lock for the UNLOCK/LOCK sum — different from the one
-        // returned by CHECK_ADMIN on some lock models.
-        ps_from_lock_ = ((uint32_t) data[2] << 24) | ((uint32_t) data[3] << 16) |
-                        ((uint32_t) data[4] <<  8) |  (uint32_t) data[5];
-        ESP_LOGD(TAG, "CHECK_USER_TIME: ps_from_lock=0x%08X", (unsigned) ps_from_lock_);
-        if (pending_op_ == PendingOp::UNLOCK) {
-          op_state_ = OpState::UNLOCK_CMD;
-          do_unlock_();
-        } else if (pending_op_ == PendingOp::LOCK) {
-          op_state_ = OpState::LOCK_CMD;
-          do_lock_();
-        } else {
-          op_state_   = OpState::IDLE;
-          pending_op_ = PendingOp::NONE;
-          this->parent()->set_enabled(false);
-        }
+        // Fresh ps_from_lock for the UNLOCK/LOCK sum — differs from CHECK_ADMIN's on some models.
+        ps_from_lock_ = get_u32_be(&data[2]);
+        TLOG(D, "CHECK_USER_TIME: ps_from_lock=0x%08X", (unsigned) ps_from_lock_);
       } else {
-        ESP_LOGE(TAG, "CHECK_USER_TIME failed (cmd=0x%02X status=0x%02X len=%d)",
+        // Fall back to the CHECK_ADMIN token already in ps_from_lock_.
+        TLOG(E, "CHECK_USER_TIME failed (cmd=0x%02X status=0x%02X len=%d)",
                  cmd, status, data.size());
-        // Fall back: proceed with existing ps_from_lock from CHECK_ADMIN
-        if (pending_op_ == PendingOp::UNLOCK) {
-          op_state_ = OpState::UNLOCK_CMD;
-          do_unlock_();
-        } else if (pending_op_ == PendingOp::LOCK) {
-          op_state_ = OpState::LOCK_CMD;
-          do_lock_();
-        } else {
-          op_state_   = OpState::IDLE;
-          pending_op_ = PendingOp::NONE;
-          this->parent()->set_enabled(false);
-        }
       }
+      start_action_();
       break;
 
     case OpState::QUERY_PASSAGE_CMD:
@@ -476,22 +456,19 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         passage_mode_ = has_entries;
         if (passage_switch_)
           passage_switch_->publish_state(passage_mode_);
-        ESP_LOGI(TAG, "Passage mode: %s", passage_mode_ ? "ACTIVE" : "INACTIVE");
-        // Re-unlock if passage mode is active but the lock reported LOCKED.
-        if (passage_mode_ && !last_status_unlocked_) {
-          ESP_LOGI(TAG, "Passage mode active but locked – re-unlocking");
+        TLOG(I, "Passage mode: %s", passage_mode_ ? "ACTIVE" : "INACTIVE");
+        // Re-unlock if passage mode is active but the lock reported LOCKED,
+        // rate-limited so a boundary auto-lock can't thrash the lock all night.
+        if (passage_mode_ && !last_status_unlocked_ && passage_reunlock_due_()) {
+          TLOG(I, "Passage mode active but locked – re-unlocking");
           pending_op_ = PendingOp::UNLOCK;
           do_check_user_time_();
         } else {
-          op_state_   = OpState::IDLE;
-          pending_op_ = PendingOp::NONE;
-          this->parent()->set_enabled(false);  // done – stop auto-reconnect
+          end_op_();  // done – stop auto-reconnect
         }
       } else {
-        ESP_LOGW(TAG, "Unexpected response in QUERY_PASSAGE_CMD (cmd=0x%02X)", cmd);
-        op_state_   = OpState::IDLE;
-        pending_op_ = PendingOp::NONE;
-        this->parent()->set_enabled(false);
+        TLOG(W, "Unexpected response in QUERY_PASSAGE_CMD (cmd=0x%02X)", cmd);
+        end_op_();
       }
       break;
 
@@ -499,12 +476,15 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
       if (cmd == CMD_CONFIGURE_PASSAGE) {
         passage_mode_ = true;
         if (status == 0x01) {
-          ESP_LOGI(TAG, "Passage mode ADD acknowledged, unlocking");
+          TLOG(I, "Passage mode ADD acknowledged, unlocking");
         } else {
-          ESP_LOGW(TAG, "Passage mode ADD status=0x%02X (proceeding anyway)", status);
+          TLOG(W, "Passage mode ADD status=0x%02X (proceeding anyway)", status);
         }
         pending_op_ = PendingOp::UNLOCK;
         do_check_user_time_();
+      } else {
+        TLOG(E, "Unexpected response in PASSAGE_ON_CMD (cmd=0x%02X)", cmd);
+        end_op_(lock::LOCK_STATE_JAMMED);
       }
       break;
 
@@ -512,92 +492,34 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
       if (cmd == CMD_CONFIGURE_PASSAGE) {
         if (status == 0x01) {
           passage_mode_ = false;
-          ESP_LOGI(TAG, "Passage mode cleared, locking");
+          TLOG(I, "Passage mode cleared, locking");
           pending_op_ = PendingOp::LOCK;
           do_check_user_time_();
         } else {
-          ESP_LOGE(TAG, "Passage mode disable failed (status=0x%02X)", status);
-          op_state_   = OpState::IDLE;
-          pending_op_ = PendingOp::NONE;
-          this->publish_state(lock::LOCK_STATE_JAMMED);
+          TLOG(E, "Passage mode disable failed (status=0x%02X)", status);
+          end_op_(lock::LOCK_STATE_JAMMED);
         }
+      } else {
+        TLOG(E, "Unexpected response in PASSAGE_OFF_CMD (cmd=0x%02X)", cmd);
+        end_op_(lock::LOCK_STATE_JAMMED);
       }
       break;
 
     case OpState::UNLOCK_CMD:
       if (cmd == CMD_UNLOCK) {
-        op_state_ = OpState::IDLE;
-        uint32_t elapsed_ms = (uint32_t)((uint64_t) esp_timer_get_time() / 1000 - request_start_ms_);
-        if (status == 0x01) {
-          pending_op_  = PendingOp::NONE;
-          retry_count_ = 0;
-          // Battery is only valid in the full success response (≥3 bytes, status=0x01)
-          if (data.size() >= 3) {
-            uint8_t battery = data[2];
-            ESP_LOGI(TAG, "Unlocked  battery=%d%%  elapsed=%" PRIu32 "ms", battery, elapsed_ms);
-            if (battery_sensor_)
-              battery_sensor_->publish_state((float) battery);
-          } else {
-            ESP_LOGI(TAG, "Unlocked  elapsed=%" PRIu32 "ms", elapsed_ms);
-          }
-          this->publish_state(lock::LOCK_STATE_UNLOCKED);
-          if (passage_switch_)
-            passage_switch_->publish_state(passage_mode_);
-          this->parent()->set_enabled(false);  // done – stop auto-reconnect
-        } else {
-          if (++retry_count_ < MAX_RETRIES) {
-            ESP_LOGW(TAG, "Unlock rejected (status=0x%02X) – retry %d/%d  elapsed=%" PRIu32 "ms",
-                     status, retry_count_, MAX_RETRIES, elapsed_ms);
-            this->publish_state(lock::LOCK_STATE_LOCKED);
-            // pending_op_ stays UNLOCK; DISCONNECT_EVT will reconnect
-          } else {
-            ESP_LOGE(TAG, "Unlock failed after %d retries – giving up  elapsed=%" PRIu32 "ms",
-                     MAX_RETRIES, elapsed_ms);
-            pending_op_  = PendingOp::NONE;
-            retry_count_ = 0;
-            this->publish_state(lock::LOCK_STATE_JAMMED);
-            this->parent()->set_enabled(false);
-          }
-        }
+        handle_action_result_(status, data, "Unlock", lock::LOCK_STATE_UNLOCKED, lock::LOCK_STATE_LOCKED);
+      } else {
+        TLOG(E, "Unexpected response in UNLOCK_CMD (cmd=0x%02X)", cmd);
+        end_op_(lock::LOCK_STATE_JAMMED);
       }
       break;
 
     case OpState::LOCK_CMD:
       if (cmd == CMD_LOCK) {
-        op_state_ = OpState::IDLE;
-        uint32_t elapsed_ms = (uint32_t)((uint64_t) esp_timer_get_time() / 1000 - request_start_ms_);
-        if (status == 0x01) {
-          pending_op_   = PendingOp::NONE;
-          retry_count_  = 0;
-          passage_mode_ = false;  // locking always exits passage mode
-          // Battery is only valid in the full success response (≥3 bytes, status=0x01)
-          if (data.size() >= 3) {
-            uint8_t battery = data[2];
-            ESP_LOGI(TAG, "Locked  battery=%d%%  elapsed=%" PRIu32 "ms", battery, elapsed_ms);
-            if (battery_sensor_)
-              battery_sensor_->publish_state((float) battery);
-          } else {
-            ESP_LOGI(TAG, "Locked  elapsed=%" PRIu32 "ms", elapsed_ms);
-          }
-          this->publish_state(lock::LOCK_STATE_LOCKED);
-          if (passage_switch_)
-            passage_switch_->publish_state(false);
-          this->parent()->set_enabled(false);  // done – stop auto-reconnect
-        } else {
-          if (++retry_count_ < MAX_RETRIES) {
-            ESP_LOGW(TAG, "Lock rejected (status=0x%02X) – retry %d/%d  elapsed=%" PRIu32 "ms",
-                     status, retry_count_, MAX_RETRIES, elapsed_ms);
-            this->publish_state(lock::LOCK_STATE_UNLOCKED);
-            // pending_op_ stays LOCK; DISCONNECT_EVT will reconnect
-          } else {
-            ESP_LOGE(TAG, "Lock failed after %d retries – giving up  elapsed=%" PRIu32 "ms",
-                     MAX_RETRIES, elapsed_ms);
-            pending_op_  = PendingOp::NONE;
-            retry_count_ = 0;
-            this->publish_state(lock::LOCK_STATE_JAMMED);
-            this->parent()->set_enabled(false);
-          }
-        }
+        handle_action_result_(status, data, "Lock", lock::LOCK_STATE_LOCKED, lock::LOCK_STATE_UNLOCKED);
+      } else {
+        TLOG(E, "Unexpected response in LOCK_CMD (cmd=0x%02X)", cmd);
+        end_op_(lock::LOCK_STATE_JAMMED);
       }
       break;
 
@@ -606,17 +528,17 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
       if (cmd == CMD_GET_STATUS && data.size() >= 4) {
         bool is_unlocked = (data[3] == 1);
         if (is_unlocked) {
-          ESP_LOGI(TAG, "Unsolicited status: UNLOCKED");
+          TLOG(I, "Unsolicited status: UNLOCKED");
           this->publish_state(lock::LOCK_STATE_UNLOCKED);
           if (passage_switch_)
             passage_switch_->publish_state(passage_mode_);
         } else {
-          ESP_LOGI(TAG, "Unsolicited status: LOCKED");
+          TLOG(I, "Unsolicited status: LOCKED");
           this->publish_state(lock::LOCK_STATE_LOCKED);
           if (passage_switch_)
             passage_switch_->publish_state(passage_mode_);
-          if (passage_mode_) {
-            ESP_LOGI(TAG, "Passage mode active, re-unlocking after unsolicited lock");
+          if (passage_mode_ && passage_reunlock_due_()) {
+            TLOG(I, "Passage mode active, re-unlocking after unsolicited lock");
             pending_op_ = PendingOp::UNLOCK;
             do_check_admin_();
           }
@@ -630,9 +552,12 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
 }
 
 // ── Operation watchdog ────────────────────────────────────────────────────────
-// Arms a 90-second one-shot timeout.  If pending operations are still set when
-// it fires, either the BLEClient is IDLE (reconnect and re-arm) or it is stuck
-// in CONNECTING/DISCONNECTING (clear ops; publish JAMMED only for user-initiated ops).
+// Arms a 90-second one-shot timeout. If pending_op_ is still set when it fires,
+// give up unconditionally — whether the BLEClient is IDLE (advertisement just
+// hasn't arrived yet) or genuinely stuck in CONNECTING/DISCONNECTING, it has
+// had its full 90s. This must be unconditional, not just re-armed while IDLE:
+// active_lock_ is shared across instances now, so an open-ended retry loop
+// here would hold the radio hostage from every other queued lock indefinitely.
 
 // Cancel and restart the 15 s connection watchdog.  Called every time a
 // connection attempt begins.  CONNECT_EVT cancels it early on success; if
@@ -646,7 +571,7 @@ void TTLockLock::arm_conn_watchdog_() {
     if (pending_op_ == PendingOp::NONE) return;
     auto st = this->parent()->state();
     if (st == espbt::ClientState::CONNECTING || st == espbt::ClientState::IDLE) {
-      ESP_LOGW(TAG, "Connection watchdog fired – disconnecting stuck BLE attempt (state=%d)", (int) st);
+      TLOG(W, "Connection watchdog fired – disconnecting stuck BLE attempt (state=%d)", (int) st);
       esp_ble_gap_disconnect(this->parent()->get_remote_bda());
     }
   });
@@ -658,27 +583,161 @@ void TTLockLock::arm_op_watchdog_() {
   set_timeout("op_wdog", 90000, [this]() {
     if (pending_op_ == PendingOp::NONE)
       return;
-    auto st = this->parent()->state();
-    ESP_LOGW(TAG, "Op watchdog fired (client state=%d)", (int) st);
-    if (st == espbt::ClientState::IDLE) {
-      ESP_LOGW(TAG, "Watchdog: client IDLE with pending ops – reconnecting");
-      this->parent()->set_enabled(true);
-      this->parent()->set_state(espbt::ClientState::DISCOVERED);
-      arm_op_watchdog_();
-    } else {
-      bool had_user_op = (pending_op_ != PendingOp::QUERY);
-      ESP_LOGE(TAG, "Watchdog: client stuck – abandoning pending ops");
-      pending_op_ = PendingOp::NONE;
-      op_state_   = OpState::IDLE;
-      rx_buf_.clear();
-      if (had_user_op)
-        this->publish_state(lock::LOCK_STATE_JAMMED);
-      this->parent()->set_enabled(false);
-    }
+    TLOG(E, "Op watchdog fired (client state=%d) – abandoning pending ops",
+             (int) this->parent()->state());
+    bool had_user_op = (pending_op_ != PendingOp::QUERY);
+    pending_op_ = PendingOp::NONE;
+    op_state_   = OpState::IDLE;
+    rx_buf_.clear();
+    if (had_user_op)
+      this->publish_state(lock::LOCK_STATE_JAMMED);
+    finish_op_();
   });
 }
 
+// ── Cross-instance BLE radio arbitration ────────────────────────────────────
+// The tracker only promotes one client to CONNECTING at a time anyway, but
+// without this a second lock commanded at the same moment still calls
+// set_enabled(true)/arm_op_watchdog_() immediately, so its 90s budget ticks
+// down while it silently waits for a tracker turn it may never get in time.
+//
+// Background QUERYs (passive status/passage polls) are lower priority than
+// user-initiated ops (UNLOCK/LOCK/PASSAGE_*): queue_ keeps all pending urgent
+// ops ahead of pending QUERYs, and an urgent op arriving while some other
+// lock's QUERY is still just trying to connect (hasn't reached the lock yet,
+// so nothing is lost by pausing it) preempts it outright instead of waiting
+// out its connect attempt — or worst case its 90s watchdog — first.
+
+void TTLockLock::begin_op_() {
+  if (active_lock_ != nullptr && active_lock_ != this) {
+    bool urgent = (pending_op_ != PendingOp::QUERY);
+    if (urgent && active_lock_->pending_op_ == PendingOp::QUERY && active_lock_->op_state_ == OpState::IDLE) {
+      active_lock_->yield_slot_();
+    } else {
+      enqueue_(this);
+      return;
+    }
+  }
+  active_lock_ = this;
+  yielded_ = false;
+  arm_op_watchdog_();
+  // Enabling lets BLEClientBase::parse_device() pick the device up off its next
+  // advertisement; with fast_connect_ we also force the connect immediately.
+  this->parent()->set_enabled(true);
+  if (this->parent()->state() == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
+    start_pending_();
+  else
+    drive_connect_();
+}
+
+// With fast_connect_, force the client into DISCOVERED so the tracker promotes it
+// to a directed connect now, instead of waiting for the scanner to catch the next
+// advertisement. No-op unless enabled and currently IDLE.
+void TTLockLock::drive_connect_() {
+  if (fast_connect_ && this->parent()->state() == espbt::ClientState::IDLE)
+    this->parent()->set_state(espbt::ClientState::DISCOVERED);
+}
+
+// Give up the radio for a higher-priority op elsewhere without abandoning our
+// own pending_op_ — it stays queued (at QUERY priority) and resumes on its
+// own turn. yielded_ suppresses the DISCONNECT_EVT auto-continue below so the
+// straggler events from this abort don't re-enable us out of turn.
+void TTLockLock::yield_slot_() {
+  cancel_timeout("op_wdog");
+  cancel_timeout("conn_wdog");
+  yielded_ = true;
+  this->parent()->set_enabled(false);
+  active_lock_ = nullptr;
+  enqueue_(this);
+}
+
+// Inserts (or re-sorts, if already queued and its priority changed) lock into
+// queue_: urgent ops before any queued QUERYs, FIFO within each group.
+void TTLockLock::enqueue_(TTLockLock *lock) {
+  auto it = std::find(queue_.begin(), queue_.end(), lock);
+  if (it != queue_.end())
+    queue_.erase(it);
+  if (lock->pending_op_ == PendingOp::QUERY) {
+    queue_.push_back(lock);
+    return;
+  }
+  auto pos = queue_.begin();
+  while (pos != queue_.end() && (*pos)->pending_op_ != PendingOp::QUERY)
+    ++pos;
+  queue_.insert(pos, lock);
+}
+
+// Call whenever this instance is done needing the radio (pending_op_ must
+// already be NONE). Releases the slot and hands it to the next queued lock.
+void TTLockLock::finish_op_() {
+  this->parent()->set_enabled(false);
+  if (active_lock_ != this)
+    return;
+  active_lock_ = nullptr;
+  while (!queue_.empty()) {
+    TTLockLock *next = queue_.front();
+    queue_.erase(queue_.begin());
+    if (next->pending_op_ != PendingOp::NONE) {
+      next->begin_op_();
+      break;
+    }
+  }
+}
+
+void TTLockLock::end_op_() {
+  cancel_timeout("op_wdog");  // op is done – don't let its 90s timer fire later and kill a fresh op
+  cancel_timeout("conn_wdog");
+  op_state_    = OpState::IDLE;
+  pending_op_  = PendingOp::NONE;
+  retry_count_ = 0;
+  finish_op_();
+}
+
+void TTLockLock::end_op_(lock::LockState publish) {
+  this->publish_state(publish);
+  end_op_();
+}
+
+void TTLockLock::handle_action_result_(uint8_t status, const std::vector<uint8_t> &data, const char *verb,
+                                       lock::LockState ok_state, lock::LockState reject_state) {
+  op_state_ = OpState::IDLE;
+  uint32_t elapsed_ms = (uint32_t)((uint64_t) esp_timer_get_time() / 1000 - request_start_ms_);
+  if (status == 0x01) {
+    if (ok_state == lock::LOCK_STATE_LOCKED)
+      passage_mode_ = false;  // locking always exits passage mode
+    if (data.size() >= 3) {
+      uint8_t battery = data[2];
+      TLOG(I, "%sed  battery=%d%%  elapsed=%ums", verb, battery, (unsigned) elapsed_ms);
+      if (battery_sensor_)
+        battery_sensor_->publish_state((float) battery);
+    } else {
+      TLOG(I, "%sed  elapsed=%ums", verb, (unsigned) elapsed_ms);
+    }
+    this->publish_state(ok_state);
+    if (passage_switch_)
+      passage_switch_->publish_state(passage_mode_);
+    end_op_();
+  } else if (++retry_count_ < MAX_RETRIES) {
+    TLOG(W, "%s rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
+             verb, status, retry_count_, MAX_RETRIES, (unsigned) elapsed_ms);
+    this->publish_state(reject_state);  // pending_op_ stays; DISCONNECT_EVT reconnects
+  } else {
+    TLOG(E, "%s failed after %d retries – giving up  elapsed=%ums",
+             verb, MAX_RETRIES, (unsigned) elapsed_ms);
+    end_op_(lock::LOCK_STATE_JAMMED);
+  }
+}
+
 // ── Normal operation sequence ─────────────────────────────────────────────────
+
+bool TTLockLock::passage_reunlock_due_() {
+  uint64_t now = (uint64_t) esp_timer_get_time() / 1000;
+  if (last_reunlock_ms_ != 0 && now - last_reunlock_ms_ < PASSAGE_REUNLOCK_COOLDOWN_MS)
+    return false;
+  last_reunlock_ms_ = now;
+  request_start_ms_ = now;  // so the re-unlock's elapsed log measures this op
+  return true;
+}
 
 void TTLockLock::start_pending_() {
   if (pending_op_ != PendingOp::NONE && pending_op_ != PendingOp::QUERY) {
@@ -688,12 +747,24 @@ void TTLockLock::start_pending_() {
   }
 }
 
+void TTLockLock::start_action_() {
+  if (pending_op_ == PendingOp::UNLOCK) {
+    op_state_ = OpState::UNLOCK_CMD;
+    do_unlock_();
+  } else if (pending_op_ == PendingOp::LOCK) {
+    op_state_ = OpState::LOCK_CMD;
+    do_lock_();
+  } else {
+    end_op_();
+  }
+}
+
 void TTLockLock::do_query_status_() {
   // COMM_SEARCH_BICYCLE_STATUS (0x14) with payload "SCIENER" queries the current
   // locked/unlocked state. Response: data[3] = 0 (LOCKED) / 1 (UNLOCKED).
   static const uint8_t payload[] = {'S','C','I','E','N','E','R'};
   op_state_ = OpState::QUERY_STATUS;
-  ESP_LOGD(TAG, "→ QUERY_STATUS");
+  TLOG(D, "→ QUERY_STATUS");
   send_cmd_(CMD_GET_STATUS, payload, sizeof(payload));
 }
 
@@ -702,24 +773,18 @@ void TTLockLock::do_check_admin_() {
   // uid (0) at offset 7 → effectively adminPs + 7 zero bytes = 11 bytes total.
   // Matches JS SDK CheckAdminCommand.build() with lockFlagPos=0, uid=0.
   uint8_t data[11] = {};
-  data[0] = (admin_ps_ >> 24) & 0xFF;
-  data[1] = (admin_ps_ >> 16) & 0xFF;
-  data[2] = (admin_ps_ >>  8) & 0xFF;
-  data[3] =  admin_ps_        & 0xFF;
+  put_u32_be(data, admin_ps_);
   // bytes 4-10 remain zero
   op_state_ = OpState::CHECK_ADMIN;
-  ESP_LOGD(TAG, "→ CHECK_ADMIN");
+  TLOG(D, "→ CHECK_ADMIN");
   send_cmd_(CMD_CHECK_ADMIN, data, sizeof(data));
 }
 
 void TTLockLock::do_check_random_() {
   uint32_t sum = ps_from_lock_ + unlock_key_;
   uint8_t data[4];
-  data[0] = (sum >> 24) & 0xFF;
-  data[1] = (sum >> 16) & 0xFF;
-  data[2] = (sum >>  8) & 0xFF;
-  data[3] =  sum        & 0xFF;
-  ESP_LOGD(TAG, "→ CHECK_RANDOM");
+  put_u32_be(data, sum);
+  TLOG(D, "→ CHECK_RANDOM");
   send_cmd_(CMD_CHECK_RANDOM, data, sizeof(data));
 }
 
@@ -734,7 +799,7 @@ void TTLockLock::do_check_user_time_() {
     0x00, 0x00, 0x00, 0x00,         // uid = 0
   };
   op_state_ = OpState::CHECK_USER_TIME_CMD;
-  ESP_LOGD(TAG, "→ CHECK_USER_TIME");
+  TLOG(D, "→ CHECK_USER_TIME");
   send_cmd_(CMD_CHECK_USER_TIME, payload, sizeof(payload));
 }
 
@@ -742,15 +807,9 @@ void TTLockLock::do_unlock_() {
   uint32_t sum = ps_from_lock_ + unlock_key_;
   uint32_t ts  = (uint32_t) time(nullptr);
   uint8_t data[8];
-  data[0] = (sum >> 24) & 0xFF;
-  data[1] = (sum >> 16) & 0xFF;
-  data[2] = (sum >>  8) & 0xFF;
-  data[3] =  sum        & 0xFF;
-  data[4] = (ts  >> 24) & 0xFF;
-  data[5] = (ts  >> 16) & 0xFF;
-  data[6] = (ts  >>  8) & 0xFF;
-  data[7] =  ts         & 0xFF;
-  ESP_LOGD(TAG, "→ UNLOCK");
+  put_u32_be(data, sum);
+  put_u32_be(data + 4, ts);
+  TLOG(D, "→ UNLOCK");
   send_cmd_(CMD_UNLOCK, data, sizeof(data));
 }
 
@@ -758,15 +817,9 @@ void TTLockLock::do_lock_() {
   uint32_t sum = ps_from_lock_ + unlock_key_;
   uint32_t ts  = (uint32_t) time(nullptr);
   uint8_t data[8];
-  data[0] = (sum >> 24) & 0xFF;
-  data[1] = (sum >> 16) & 0xFF;
-  data[2] = (sum >>  8) & 0xFF;
-  data[3] =  sum        & 0xFF;
-  data[4] = (ts  >> 24) & 0xFF;
-  data[5] = (ts  >> 16) & 0xFF;
-  data[6] = (ts  >>  8) & 0xFF;
-  data[7] =  ts         & 0xFF;
-  ESP_LOGD(TAG, "→ LOCK");
+  put_u32_be(data, sum);
+  put_u32_be(data + 4, ts);
+  TLOG(D, "→ LOCK");
   send_cmd_(CMD_LOCK, data, sizeof(data));
 }
 
@@ -774,7 +827,7 @@ void TTLockLock::do_query_passage_() {
   // 0x66 QUERY: op=1, seq=0 (request first page of schedule entries)
   static const uint8_t payload[] = {0x01, 0x00};
   op_state_ = OpState::QUERY_PASSAGE_CMD;
-  ESP_LOGD(TAG, "→ QUERY_PASSAGE");
+  TLOG(D, "→ QUERY_PASSAGE");
   send_cmd_(CMD_CONFIGURE_PASSAGE, payload, sizeof(payload));
 }
 
@@ -782,7 +835,7 @@ void TTLockLock::do_passage_clear_() {
   // COMM_CONFIGURE_PASSAGE_MODE CLEAR: remove all passage mode entries.
   // Only reached when QUERY found stale entries (passage-ON) or for passage-OFF.
   static const uint8_t payload[] = {0x04};
-  ESP_LOGD(TAG, "→ PASSAGE_CLEAR");
+  TLOG(D, "→ PASSAGE_CLEAR");
   send_cmd_(CMD_CONFIGURE_PASSAGE, payload, sizeof(payload));
 }
 
@@ -792,14 +845,14 @@ void TTLockLock::do_passage_on_() {
   // Payload: [op=ADD(2), type=WEEKLY(1), seq=0, weekOrDay=0x7f(all dayes), startH=0, startM=0, endH=23, endM=59]
   static const uint8_t payload[] = {0x02, 0x01, 0x00, 0x7F, 0x00, 0x00, 0x17, 0x3B};
   op_state_ = OpState::PASSAGE_ON_CMD;
-  ESP_LOGD(TAG, "→ PASSAGE_ON (add)");
+  TLOG(D, "→ PASSAGE_ON (add)");
   send_cmd_(CMD_CONFIGURE_PASSAGE, payload, sizeof(payload));
 }
 
 void TTLockLock::do_passage_off_() {
   // Send 0x66 CLEAR then LOCK. passage_mode_ will be cleared in PASSAGE_OFF_CMD handler.
   op_state_ = OpState::PASSAGE_OFF_CMD;
-  ESP_LOGD(TAG, "→ PASSAGE_CLEAR (off)");
+  TLOG(D, "→ PASSAGE_CLEAR (off)");
   do_passage_clear_();
 }
 
@@ -811,20 +864,14 @@ void TTLockPassageSwitch::write_state(bool state) {
 }
 
 void TTLockLock::request_update() {
-  ESP_LOGI(TAG, "Got request to update status");
+  TLOG(I, "Got request to update status");
   if (pending_op_ == PendingOp::NONE)
     pending_op_ = PendingOp::QUERY;
-  arm_op_watchdog_();
-  this->parent()->set_enabled(true);
-  auto ble_st = this->parent()->state();
-  if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
-    start_pending_();
-  else if (ble_st == espbt::ClientState::IDLE)
-    this->parent()->set_state(espbt::ClientState::DISCOVERED);
+  begin_op_();
 }
 
 void TTLockLock::set_passage_mode(bool enable) {
-  ESP_LOGI(TAG, "Passage mode %s", enable ? "ON" : "OFF");
+  TLOG(I, "Passage mode %s", enable ? "ON" : "OFF");
   request_start_ms_ = (uint64_t) esp_timer_get_time() / 1000;
   retry_count_ = 0;
   passage_mode_ = enable;
@@ -834,13 +881,7 @@ void TTLockLock::set_passage_mode(bool enable) {
   } else {
     this->publish_state(lock::LOCK_STATE_LOCKING);
   }
-  arm_op_watchdog_();
-  this->parent()->set_enabled(true);
-  auto ble_st = this->parent()->state();
-  if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
-    start_pending_();
-  else if (ble_st == espbt::ClientState::IDLE)
-    this->parent()->set_state(espbt::ClientState::DISCOVERED);
+  begin_op_();
 }
 
 // ── lock::Lock interface ─────────────────────────────────────────────────────
@@ -849,20 +890,12 @@ void TTLockLock::control(const lock::LockCall &call) {
   auto state = call.get_state();
   if (!state.has_value()) return;
 
-  this->parent()->set_enabled(true);
   request_start_ms_ = (uint64_t) esp_timer_get_time() / 1000;
   retry_count_ = 0;
   if (*state == lock::LOCK_STATE_UNLOCKED) {
     pending_op_ = PendingOp::UNLOCK;
     this->publish_state(lock::LOCK_STATE_UNLOCKING);
-    arm_op_watchdog_();
-    {
-      auto ble_st = this->parent()->state();
-      if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
-        start_pending_();
-      else if (ble_st == espbt::ClientState::IDLE)
-        this->parent()->set_state(espbt::ClientState::DISCOVERED);
-    }
+    begin_op_();
 
   } else if (*state == lock::LOCK_STATE_LOCKED) {
     if (passage_mode_) {
@@ -870,12 +903,7 @@ void TTLockLock::control(const lock::LockCall &call) {
     } else {
       pending_op_ = PendingOp::LOCK;
       this->publish_state(lock::LOCK_STATE_LOCKING);
-      arm_op_watchdog_();
-      auto ble_st = this->parent()->state();
-      if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
-        start_pending_();
-      else if (ble_st == espbt::ClientState::IDLE)
-        this->parent()->set_state(espbt::ClientState::DISCOVERED);
+      begin_op_();
     }
   }
 }
@@ -884,7 +912,7 @@ void TTLockLock::control(const lock::LockCall &call) {
 
 void TTLockLock::setup() {
   this->publish_state(lock::LOCK_STATE_NONE);
-  ESP_LOGI(TAG, "TTLock setup: addr=%s", this->parent()->address_str());
+  TLOG(I, "TTLock setup");
 }
 
 // ── Advertisement parser ─────────────────────────────────────────────────────
@@ -930,7 +958,8 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
     if ((state == adv_state) && (pending_op_ == PendingOp::NONE))
       return false;
 
-    ESP_LOGI(TAG, "[%s] ADV params=0x%02X -> %s, current state -> %s", this->parent()->address_str(), params, LOG_STR_ARG(lock::lock_state_to_string(adv_state)), LOG_STR_ARG(lock::lock_state_to_string(state)));
+    TLOG(I, "ADV params=0x%02X -> %s, current state -> %s", params,
+             LOG_STR_ARG(lock::lock_state_to_string(adv_state)), LOG_STR_ARG(lock::lock_state_to_string(state)));
 
     // Don't overwrite state mid-operation (GATTC sequence is authoritative)
     if ((pending_op_ == PendingOp::NONE) || (pending_op_ == PendingOp::QUERY)) {
@@ -939,15 +968,9 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
 
     // Params changed → trigger a status/passage query connection.
     // PendingOp::QUERY makes the watchdog active for this connection (not just user ops).
-    // Use set_state(DISCOVERED) so the tracker stops the scanner before connecting;
-    // calling connect() directly while the scanner is RUNNING leaves scanner_state_
-    // stuck at RUNNING after disconnect, preventing scan restart.
     if (pending_op_ == PendingOp::NONE)
       pending_op_ = PendingOp::QUERY;
-    arm_op_watchdog_();
-    this->parent()->set_enabled(true);
-    if (this->parent()->state() == espbt::ClientState::IDLE)
-      this->parent()->set_state(espbt::ClientState::DISCOVERED);
+    begin_op_();
     return true;
   }
   return false;
@@ -955,10 +978,9 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
 
 void TTLockLock::dump_config() {
   LOG_LOCK("", "TTLock", this);
-  ESP_LOGCONFIG(TAG, "  Address: %s", this->parent()->address_str());
-  ESP_LOGCONFIG(TAG, "  Protocol: type=0x%02X  ver=0x%02X  scene=0x%02X  group=0x%04X  org=0x%04X",
+  TLOG(CONFIG, "  Protocol: type=0x%02X  ver=0x%02X  scene=0x%02X  group=0x%04X  org=0x%04X",
                 lv_.proto_type, lv_.proto_ver, lv_.scene, lv_.group_id, lv_.org_id);
-  ESP_LOGCONFIG(TAG, "  Credentials: configured");
+  TLOG(CONFIG, "  Credentials: configured");
 }
 
 }  // namespace ttlock

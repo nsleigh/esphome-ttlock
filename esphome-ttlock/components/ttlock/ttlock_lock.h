@@ -104,6 +104,7 @@ class TTLockLock : public lock::Lock,
   void set_org_id(uint16_t v)     { lv_.org_id     = v; }
   void set_battery_sensor(sensor::Sensor *s) { battery_sensor_ = s; }
   void set_passage_switch(TTLockPassageSwitch *s) { passage_switch_ = s; }
+  void set_fast_connect(bool v)   { fast_connect_ = v; }
 
   // Called by TTLockPassageSwitch
   void set_passage_mode(bool enable);
@@ -147,16 +148,20 @@ class TTLockLock : public lock::Lock,
   uint32_t    unlock_key_ {0};
   uint8_t     aes_key_[16]{};
   LockVersion lv_;
+  bool        fast_connect_{true};  // actively re-drive connects instead of waiting for an advertisement
 
   // ── Operation state ────────────────────────────────────────────────────
   OpState   op_state_   {OpState::IDLE};
   PendingOp pending_op_ {PendingOp::NONE};
+  bool      yielded_    {false};  // true while parked after being preempted mid-connect
   bool      passage_mode_ {false};
   bool     last_status_unlocked_ {false};
   uint32_t ps_from_lock_         {0};
   uint8_t  retry_count_          {0};  // protocol-level retries (unlock/lock rejection)
   uint64_t request_start_ms_     {0};  // esp_timer ms at control()/set_passage_mode() entry
-  static constexpr uint8_t MAX_RETRIES = 3;
+  uint64_t last_reunlock_ms_     {0};  // esp_timer ms of last passage re-unlock (0 = never)
+  static constexpr uint8_t  MAX_RETRIES = 3;
+  static constexpr uint32_t PASSAGE_REUNLOCK_COOLDOWN_MS = 300000;  // 5 min
 
   // ── RX buffer (reassembly across MTU chunks) ───────────────────────────
   std::vector<uint8_t> rx_buf_;
@@ -179,10 +184,28 @@ class TTLockLock : public lock::Lock,
   void on_ble_data_(const uint8_t *data, uint16_t len);
   void handle_response_(uint8_t cmd, const std::vector<uint8_t> &payload);
 
+  // ── Cross-instance BLE radio arbitration ────────────────────────────────
+  // Only one instance may hold the BLE client enabled at a time; others queue
+  // (background QUERYs behind user-initiated ops) and get a fresh op watchdog
+  // once it's actually their turn.
+  static TTLockLock              *active_lock_;
+  static std::vector<TTLockLock *> queue_;
+  static void enqueue_(TTLockLock *lock);
+  void begin_op_();
+  void finish_op_();
+  void yield_slot_();
+  void drive_connect_();   // if fast_connect_ and IDLE, force a connect instead of waiting for an advertisement
+  void end_op_();                           // reset state + release radio
+  void end_op_(lock::LockState publish);    // publish final state, then end_op_()
+  void handle_action_result_(uint8_t status, const std::vector<uint8_t> &data, const char *verb,
+                             lock::LockState ok_state, lock::LockState reject_state);
+
   // ── Lock/unlock sequence ───────────────────────────────────────────────
   void arm_conn_watchdog_();
   void arm_op_watchdog_();
+  bool passage_reunlock_due_();   // true (and arms cooldown) if a re-unlock is allowed now
   void start_pending_();
+  void start_action_();   // dispatch pending UNLOCK/LOCK to its command, else end_op_()
   void do_query_status_();
   void do_check_admin_();
   void do_check_random_();
