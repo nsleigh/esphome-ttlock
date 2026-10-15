@@ -373,7 +373,9 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
 
     case OpState::QUERY_STATUS:
       if (cmd == CMD_GET_STATUS && data.size() >= 4) {
-        // data[3] = LockedStatus: 0 = LOCKED, 1 = UNLOCKED (JS SDK convention)
+        // data[2] = battery %, data[3] = LockedStatus: 0 = LOCKED, 1 = UNLOCKED (JS SDK convention)
+        if (battery_sensor_ && data[2] <= 100)
+          battery_sensor_->publish_state((float) data[2]);
         last_status_unlocked_ = (data[3] == 1);
         if (last_status_unlocked_) {
           TLOG(I, "Lock status: UNLOCKED");
@@ -943,9 +945,10 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
       if (mfr.data.size() >= 8) battery = mfr.data[7];
     }
 
-    if (battery != 0xFF && battery_sensor_)
-      if (battery_sensor_->get_state() != (float) battery)
-        battery_sensor_->publish_state((float) battery);
+    // Advertised battery is unreliable (intermittently reports 100%); the sensor is
+    // fed from GATT responses instead. Log mismatches for diagnosis only.
+    if (battery != 0xFF && battery_sensor_ && battery_sensor_->get_state() != (float) battery)
+      TLOG(D, "ADV battery=%d%% (ignored) params=0x%02X", battery, params);
 
     // Ignore park status reports
     if (params & 0x10)
