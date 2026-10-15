@@ -367,6 +367,20 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
   TLOG(D, "RX cmd=0x%02X status=0x%02X len=%d op=%d",
            cmd, status, data.size(), (int) op_state_);
 
+  // Unsolicited status notification (e.g. auto-relock) arriving mid-sequence:
+  // record it and keep waiting for the reply we actually asked for, rather than
+  // treating it as a failed response (which ends the op as JAMMED).
+  if (cmd == CMD_GET_STATUS && op_state_ != OpState::QUERY_STATUS && op_state_ != OpState::IDLE) {
+    if (data.size() >= 4) {
+      last_status_unlocked_ = (data[3] == 1);
+      TLOG(I, "Unsolicited status mid-op: %s", last_status_unlocked_ ? "UNLOCKED" : "LOCKED");
+      // Only publish when no user lock/unlock is in flight; its own result is authoritative.
+      if (pending_op_ == PendingOp::NONE || pending_op_ == PendingOp::QUERY)
+        this->publish_state(last_status_unlocked_ ? lock::LOCK_STATE_UNLOCKED : lock::LOCK_STATE_LOCKED);
+    }
+    return;
+  }
+
   switch (op_state_) {
 
     // ── Status query (idle reconnect) ─────────────────────────────────────
